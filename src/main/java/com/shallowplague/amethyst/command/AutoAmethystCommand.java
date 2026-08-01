@@ -90,6 +90,9 @@ public class AutoAmethystCommand extends Command {
                     .addField("Yield/hr", String.format("%.1f", m.yieldPerHour()))
                     .addField("Mature in box", m.matureInBox())
                     .addField("In reach", m.reachableCount())
+                    .addField("Shards on ground", m.shardsOnGround()
+                        + " in " + m.shardStacksOnGround() + " stack(s)"
+                        + (m.shardsStranded() > 0 ? " (+" + m.shardsStranded() + " cooling off)" : ""))
                     .addField("Skipped", m.skippedCount())
                     .addField("Reverted", m.reverts())
                     .addField("Tool swaps", m.toolSwaps())
@@ -369,11 +372,10 @@ public class AutoAmethystCommand extends Command {
             })))
             .then(literal("sprint").then(argument("toggle", toggle()).executes(c -> {
                 PLUGIN_CONFIG.movement.sprint = getToggle(c, "toggle");
-                PLUGIN_CONFIG.collection.sprintWhileCollecting = PLUGIN_CONFIG.movement.sprint;
                 module().requestReload();
                 c.getSource().getEmbed()
                     .title("Sprint " + toggleStrCaps(PLUGIN_CONFIG.movement.sprint))
-                    .description("Applies to the hand driven walk and to the pathfinder.");
+                    .description("Applies to the pathfinder and to the short walk onto a drop.");
             })))
                         .then(literal("tool").then(argument("toggle", toggle()).executes(c -> {
                 PLUGIN_CONFIG.tool.enabled = getToggle(c, "toggle");

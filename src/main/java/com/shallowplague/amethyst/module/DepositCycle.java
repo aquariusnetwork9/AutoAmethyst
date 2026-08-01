@@ -24,6 +24,7 @@ import org.jspecify.annotations.Nullable;
 
 import java.util.function.Predicate;
 
+import static com.shallowplague.amethyst.AutoAmethystPlugin.PLUGIN_CONFIG;
 import static com.zenith.Globals.BARITONE;
 import static com.zenith.Globals.CACHE;
 import static com.zenith.Globals.INPUTS;
@@ -99,6 +100,8 @@ public final class DepositCycle {
     private final DropCollector shulkerCollector;
     /** Reused rather than reallocated each tick; only two fields are ever set on it. */
     private final AutoAmethystConfig.Collection collectCfg = new AutoAmethystConfig.Collection();
+    /** Monotonic tick count, only used to age the collector's retry cooldowns. */
+    private long ticks = 0;
 
     private Phase phase = Phase.IDLE;
     private int phaseTicks = 0;
@@ -155,6 +158,7 @@ public final class DepositCycle {
     public Status tick(final Predicate<ItemStack> yield, final AutoAmethystConfig.Deposit cfg,
                        final double reach, final boolean requireLineOfSight, final int priority) {
         if (phase == Phase.IDLE) return Status.DONE;
+        ticks++;
         if (actionCooldown > 0) {
             actionCooldown--;
             return Status.BUSY;
@@ -443,11 +447,16 @@ public final class DepositCycle {
     }
 
     private Status tickCollectShulker(final AutoAmethystConfig.Deposit cfg, final int priority) {
-        collectCfg.maxDistance = Math.max(2.0, cfg.collectRadius);
         collectCfg.chaseTimeoutTicks = cfg.collectTimeoutTicks;
+        // A small cube around the deposit spot rather than the geode box: the only thing being
+        // picked up here is the shulker just broken, and it cannot have gone far.
+        final int r = Math.max(2, (int) Math.ceil(cfg.collectRadius));
+        final DropCollector.Bounds bounds = new DropCollector.Bounds(
+            cfg.x - r, cfg.y - r, cfg.z - r, cfg.x + r, cfg.y + r, cfg.z + r);
 
         final DropCollector.Status status = shulkerCollector.tick(
-            HarvestPolicy::isShulkerItem, collectCfg, cfg.x + 0.5, cfg.y + 0.5, cfg.z + 0.5);
+            HarvestPolicy::isShulkerItem, collectCfg, bounds, ticks, priority,
+            PLUGIN_CONFIG.movement.sprint);
         return switch (status) {
             case CHASING -> Status.BUSY;
             case DONE -> {

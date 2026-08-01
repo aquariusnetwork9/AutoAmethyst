@@ -358,9 +358,7 @@ public class AutoAmethystModule extends Module {
             fullScan();
         }
 
-        if (PLUGIN_CONFIG.collection.enabled
-            && collector.hasWorkNear(this::isOurYield, anchorX, anchorY, anchorZ,
-                                     PLUGIN_CONFIG.collection.maxDistance)) {
+        if (dropsWaiting()) {
             state = State.COLLECTING;
             return;
         }
@@ -397,6 +395,15 @@ public class AutoAmethystModule extends Module {
         final int x = BlockPos.getX(currentTarget);
         final int y = BlockPos.getY(currentTarget);
         final int z = BlockPos.getZ(currentTarget);
+
+        // Shards on the floor come first, even part way to a cluster. Every drop is on a five
+        // minute despawn timer, and the whole point of the serial cycle is that the ground is clear
+        // before the next cluster comes down on top of it.
+        if (dropsWaiting()) {
+            travel.stop();
+            state = State.COLLECTING;
+            return;
+        }
 
         // It may have been broken by someone else, or reverted, while we walked.
         if (World.isChunkLoadedBlockPos(x, z) && !isHarvestable(World.getBlock(x, y, z))) {
@@ -469,9 +476,32 @@ public class AutoAmethystModule extends Module {
         }
     }
 
+    /** True when there are shards on the geode floor worth walking to. */
+    private boolean dropsWaiting() {
+        return PLUGIN_CONFIG.collection.enabled
+            && collector.hasWork(this::isOurYield, bounds(), tickCounter);
+    }
+
+    /**
+     * The region swept for dropped shards: the geode box, grown by a margin.
+     *
+     * <p>Grown because a break throws its drop a block or two and shards then fall to whatever is
+     * below, so a box drawn tightly around the clusters does not contain everything the farm
+     * produces. This replaced a leash measured from the bot's own position, which was a
+     * three-dimensional distance and so excluded anything on a lower level.
+     */
+    private DropCollector.Bounds bounds() {
+        final AutoAmethystConfig.Harvest h = harvest();
+        final int m = Math.max(0, PLUGIN_CONFIG.collection.boxMargin);
+        return new DropCollector.Bounds(
+            h.minX - m, h.minY - m, h.minZ - m,
+            h.maxX + m, h.maxY + m, h.maxZ + m);
+    }
+
     private void tickCollecting() {
         final DropCollector.Status status = collector.tick(
-            this::isOurYield, PLUGIN_CONFIG.collection, anchorX, anchorY, anchorZ);
+            this::isOurYield, PLUGIN_CONFIG.collection, bounds(), tickCounter,
+            harvest().inputPriority, PLUGIN_CONFIG.movement.sprint);
         switch (status) {
             case CHASING -> { }
             case DONE -> {
@@ -504,7 +534,7 @@ public class AutoAmethystModule extends Module {
                 yieldAtStart = after;
                 shulkersStored = depositCycle.shulkersStored();
                 setAnchorHere();
-                collector.clearUnreachable();
+                collector.clearCooldowns();
                 scanTimer.skip();
                 state = State.IDLE;
                 if (freeInventorySlots() <= Math.max(0, PLUGIN_CONFIG.deposit.triggerFreeSlots)) {
@@ -971,6 +1001,13 @@ public class AutoAmethystModule extends Module {
         if (travel.isActive()) {
             out.add("travelling: " + travel.ticks() + " ticks so far");
         }
+        out.add("shards on the ground=" + collector.groundItems()
+            + " in " + collector.groundStacks() + " stack(s)"
+            + (collector.strandedStacks() > 0
+                ? "  (+" + collector.strandedStacks() + " stack(s) on retry cooldown)" : "")
+            + (collector.truncated() > 0
+                ? "  (+" + collector.truncated() + " beyond the batch cap)" : "")
+            + "  collector=" + collector.modeName());
         out.add("collection=" + (PLUGIN_CONFIG.collection.enabled ? "on" : "off")
             + "  deposit=" + (PLUGIN_CONFIG.deposit.enabled ? "on" : "off")
             + "  home=" + (PLUGIN_CONFIG.movement.homeSet ? "set" : "not set")
@@ -1105,6 +1142,9 @@ public class AutoAmethystModule extends Module {
     public long deposits() { return deposits; }
     public int shulkersStored() { return shulkersStored; }
     public int matureInBox() { return matureInBox; }
+    public int shardsOnGround() { return collector.groundItems(); }
+    public int shardStacksOnGround() { return collector.groundStacks(); }
+    public int shardsStranded() { return collector.strandedStacks(); }
     public int reachableCount() { return matureTargets.size(); }
     public boolean pathfinderClamped() { return pathGuard.isApplied() && pathGuard.stillClamped(); }
 }

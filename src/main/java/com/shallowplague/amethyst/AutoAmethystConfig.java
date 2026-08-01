@@ -215,102 +215,72 @@ public class AutoAmethystConfig {
 
     public static final class Collection {
         /**
-         * Walk onto dropped items instead of relying on the ~1 block vanilla pickup radius. A
-         * broken block's drop can fly a couple of blocks, so without this the farm slowly leaks
-         * yield onto the floor to despawn after five minutes.
+         * Sweep the geode for dropped shards and walk onto them.
+         *
+         * <p>Passive pickup is not enough on its own: a break throws its drop a block or two, and
+         * shards then fall to whatever level is below, well outside the radius the server hands
+         * items over on. Without this the farm quietly leaks yield onto the floor to despawn after
+         * five minutes.
          */
         public boolean enabled = true;
 
         /**
-         * Leash, in blocks from the stand position. The bot will not chase a drop further than
-         * this, and walks back to its stand position afterwards so it cannot drift over time.
-         */
-        public double maxDistance = 6.0;
-
-        /**
-         * How close a drop must be to be worth grabbing while there are still clusters in reach.
-         * Anything further waits until the bot has nothing to break, so collection can never starve
-         * harvesting. 0 means never interrupt harvesting to collect.
-         */
-        public double opportunisticRadius = 3.0;
-
-        /** Give up on one drop after this long. */
-        public int chaseTimeoutTicks = 80;
-
-        /** Ticks of no measurable movement before a chase is considered stuck. */
-        public int stuckTicks = 40;
-
-        /** Sneak while collecting. Off by default; sneaking makes chasing a drop very slow. */
-        public boolean sneakWhileCollecting = false;
-
-        /** Run while chasing drops. */
-        public boolean sprintWhileCollecting = true;
-
-        /**
-         * Jump for drops that are above the bot - on top of a block, on a ledge, or up a step the
-         * 0.6 block auto-step cannot clear. Also used to hop when a chase stops making progress.
-         */
-        public boolean jumpForDrops = true;
-
-        /** How far above the bot's feet a drop must be before jumping at it. */
-        public double jumpHeightThreshold = 0.55;
-
-        /** Ticks of no progress in a chase before trying a jump. */
-        public int jumpAfterStuckTicks = 10;
-
-        /**
-         * Hand the chase to the pathfinder when a drop cannot simply be walked and jumped to.
+         * How far outside the geode box a dropped shard still counts, in blocks.
          *
-         * <p>A jump clears about 1.25 blocks. A shard that landed on a ledge above that is
-         * unreachable by walking at it, and a bot that keeps trying just bounces off the wall until
-         * the chase times out - even when there is a ladder a couple of blocks away. The pathfinder
-         * knows how to use the ladder. This is only safe because {@link
-         * com.shallowplague.amethyst.module.PathfinderGuard} has already clamped its ability to
-         * break or place, so it can route to the drop but never mine its way there.
+         * <p>This replaces the old "leash from the bot's stand position", which was a
+         * three-dimensional distance and therefore excluded anything that had fallen a couple of
+         * levels - the bot ignored bottom-level shards entirely. The farm is the box; a shard in
+         * the box gets collected however far away it is.
          */
-        public boolean usePathfinder = true;
+        public int boxMargin = 6;
 
-        /** Vertical difference, up or down, beyond which the pathfinder takes the leg. */
-        public double pathfinderHeightThreshold = 1.25;
-
-        /** Ticks of a stuck hand walk before escalating that chase to the pathfinder. */
-        public int escalateToPathTicks = 20;
+        /** Most drops handed to the pathfinder in one goal. */
+        public int maxGoalsPerSweep = 32;
 
         /**
-         * Leash for chases the pathfinder is driving, separate from the hand-walk {@link
-         * #maxDistance}. Shards fall to whatever level is below the bot, so a leash tight enough to
-         * keep a hand walk sane is far too tight to collect off another floor of the rig.
-         */
-        public double pathMaxDistance = 16.0;
-
-        /**
-         * Timeout for a chase the pathfinder is driving. Much longer than the hand-walk timeout:
-         * climbing down a ladder, crossing a level and coming back is easily ten seconds, and the
-         * short timeout was abandoning perfectly good trips part way through.
-         */
-        public int pathChaseTimeoutTicks = 400;
-
-        /**
-         * Ticks to wait for the pathfinder to start moving before writing a drop off as unreachable.
+         * Walk directly at a drop this close rather than asking the pathfinder, in blocks.
          *
-         * <p>Some shards land where nothing can walk - a gap between the rig and the geode wall, a
-         * ledge with no standable block beside it. The pathfinder answers "No path found" for those
-         * after searching millions of nodes, and without this the bot then stood there for the whole
-         * chase timeout doing nothing. Giving up in a second instead of six is most of the win.
+         * <p>This is the only thing that collects a shard resting on budding amethyst. The
+         * pathfinder will not route onto one - {@code MovementHelper.isBlockNormalCube} excludes
+         * every amethyst-named block except {@code amethyst_block} - even though a vanilla client
+         * walks over it perfectly happily. It is also what gets the bot standing on top of a drop
+         * rather than beside it, which 2b2t sometimes insists on before handing the item over.
+         */
+        public double nudgeRadius = 3.0;
+
+        /** Height difference, up or down, within which a drop is close enough to walk straight at. */
+        public double nudgeHeight = 1.25;
+
+        /** Give up walking directly at a drop after this long and hand it to the pathfinder. */
+        public int nudgeTimeoutTicks = 50;
+
+        /** Ticks of no movement during a direct walk before treating it as blocked. */
+        public int nudgeStuckTicks = 12;
+
+        /** How long before a drop that a direct walk could not reach is walked at again. */
+        public int nudgeRetryTicks = 200;
+
+        /**
+         * Ticks to wait for the pathfinder to produce a route before dropping to a looser goal, and
+         * then before writing the batch off.
+         *
+         * <p>Short on purpose. "No path found" comes back almost immediately when every goal is
+         * unstandable, and the bot used to stand there for the whole chase timeout doing nothing.
          */
         public int pathGiveUpTicks = 40;
 
-        /**
-         * How close to the stand position counts as "back".
-         *
-         * <p>Only used for a hand-walked return. A pathed return is judged against at least the
-         * precision of the goal it used, because a tolerance tighter than the goal can never be
-         * satisfied and the leg would repath forever.
-         */
-        public double returnTolerance = 0.6;
+        /** Ticks spent walking with nothing picked up before parking that drop and moving on. */
+        public int chaseTimeoutTicks = 400;
 
-        /** Give up walking home after this long and just re-anchor where the bot is standing. */
-        public int returnTimeoutTicks = 400;
+        /**
+         * How long a drop that could not be reached is left alone before being tried again.
+         *
+         * <p>Never permanent. An earlier version remembered unreachable drops in a set cleared only
+         * by a successful deposit, so a single transient path failure meant that shard was ignored
+         * for the rest of the run - which looked exactly like the bot not caring about drops at
+         * all.
+         */
+        public int retryCooldownTicks = 1200;
     }
 
     public final Deposit deposit = new Deposit();
