@@ -132,6 +132,10 @@ public final class DropCollector {
     /** Ticks since a shard was last actually picked up. */
     public int noProgressTicks() { return noProgressTicks; }
 
+    /** Ticks spent on the current direct walk, and of those how many with no movement at all. */
+    public int nudgeTicks() { return nudgeTicks; }
+    public int nudgeStuckTicks() { return nudgeStuck; }
+
     // Nearest drop being worked on, for the "why is it not collecting" output. Positions are raw
     // world coords; the caller renders them box-relative so no real coordinates reach a log.
     public boolean hasNearestDrop() { return !visible.isEmpty(); }
@@ -198,6 +202,22 @@ public final class DropCollector {
 
         truncated = Math.max(0, visible.size() - Math.max(1, cfg.maxGoalsPerSweep));
 
+        // Hard backstop, evaluated before any mode logic. It used to live inside path(), which the
+        // mode flapping below never reached: every bounce back from NUDGE took path()'s "start a
+        // new goal" branch and returned early, so the counter climbed past 800 ticks while nothing
+        // ever escalated or gave up. A give-up rule that a state transition can skip is not a
+        // give-up rule.
+        if (noProgressTicks > Math.max(60, cfg.chaseTimeoutTicks)) {
+            final Drop giveUp = visible.get(0);
+            cooldown.put(giveUp.id(), tick + Math.max(20, cfg.retryCooldownTicks));
+            stopAll();
+            failReason = "could not reach a drop in " + noProgressTicks + " ticks, retrying within "
+                + (Math.max(20, cfg.retryCooldownTicks) / 20) + "s";
+            noProgressTicks = 0;
+            lastItems = -1;
+            return Status.CHASING; // next sweep picks up whatever else is down there
+        }
+
         // Nearest one we can simply walk at - not necessarily the nearest one overall, since the
         // closest drop may be the one a direct walk has already failed on.
         Drop walkable = null;
@@ -221,10 +241,17 @@ public final class DropCollector {
 
     private boolean withinNudgeRange(final Drop d, final AutoAmethystConfig.Collection cfg) {
         if (nudgeBlocked.containsKey(d.id())) return false;
+        // Hysteresis. Once committed to walking at a drop, keep at it until the walk itself ends.
+        // Judging entry and exit by the same threshold made the mode flap between NUDGE and the
+        // pathfinder every time the drop drifted across the boundary - and every bounce restarted
+        // the pathfinder's escalation, so neither route ever got anywhere.
+        final boolean committed = mode == Mode.NUDGE && nudgeTarget == d.id();
+        final double radius = Math.max(1.0, cfg.nudgeRadius) + (committed ? 1.0 : 0.0);
+        final double height = Math.max(0.5, cfg.nudgeHeight) + (committed ? 0.75 : 0.0);
         final double dx = d.ex() - BOT.getX();
         final double dz = d.ez() - BOT.getZ();
-        if (Math.sqrt(dx * dx + dz * dz) > Math.max(1.0, cfg.nudgeRadius)) return false;
-        return Math.abs(d.ey() - BOT.getY()) <= Math.max(0.5, cfg.nudgeHeight);
+        if (Math.sqrt(dx * dx + dz * dz) > radius) return false;
+        return Math.abs(d.ey() - BOT.getY()) <= height;
     }
 
     /**

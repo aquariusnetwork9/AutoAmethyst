@@ -1015,6 +1015,8 @@ public class AutoAmethystModule extends Module {
                 describe(BlockPos.asLong(collector.nearestDropX(), collector.nearestDropY(),
                                          collector.nearestDropZ())),
                 collector.nearestDropNudgeBlocked(), collector.noProgressTicks()));
+            out.add("direct walk: " + collector.nudgeTicks() + " ticks, "
+                + collector.nudgeStuckTicks() + " of them with no movement");
         }
         out.add("collection=" + (PLUGIN_CONFIG.collection.enabled ? "on" : "off")
             + "  deposit=" + (PLUGIN_CONFIG.deposit.enabled ? "on" : "off")

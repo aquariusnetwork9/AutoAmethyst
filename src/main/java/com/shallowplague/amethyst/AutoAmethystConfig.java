@@ -246,10 +246,17 @@ public class AutoAmethystConfig {
          * walks over it perfectly happily. It is also what gets the bot standing on top of a drop
          * rather than beside it, which 2b2t sometimes insists on before handing the item over.
          */
-        public double nudgeRadius = 3.0;
+        public double nudgeRadius = 3.5;
 
-        /** Height difference, up or down, within which a drop is close enough to walk straight at. */
-        public double nudgeHeight = 1.25;
+        /**
+         * Height difference, up or down, within which a drop is close enough to walk straight at.
+         *
+         * <p>Generous on purpose. Shards fall to whatever level is below, so "one floor down" is
+         * the common case rather than the exception, and the vanilla pickup box reaches 2.3 blocks
+         * above the feet anyway. A tight value here just means the bot stands looking at a shard
+         * one level away and hands it to a pathfinder that cannot stand on the geode floor either.
+         */
+        public double nudgeHeight = 2.5;
 
         /** Give up walking directly at a drop after this long and hand it to the pathfinder. */
         public int nudgeTimeoutTicks = 50;
