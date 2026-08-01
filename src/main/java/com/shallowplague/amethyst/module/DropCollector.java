@@ -28,11 +28,16 @@ import static com.zenith.Globals.INPUTS;
  * was broken, which is well outside the ~1 block vanilla pickup radius, so a bot that never moves
  * would steadily leak shards onto the floor to despawn five minutes later.
  *
- * <p>Movement is a short sneaking walk driven by ordinary vanilla inputs, never the pathfinder.
- * That is deliberate: the pathfinder is entitled to decide that the way to reach something is to
- * mine through it, and inside the rig that is exactly what must never happen. A hand walk can only
- * ever move the bot. Everything stays inside {@code maxDistance} of the anchor, and the bot walks
- * back to the anchor afterwards so it does not drift off its stand position over hours of running.
+ * <p>Two ways to move. A short hand walk on ordinary vanilla inputs for anything nearby, and the
+ * pathfinder for drops it cannot simply walk onto - another level of the rig, the far side of a
+ * wall, anywhere needing a ladder. Handing those to the pathfinder is only safe because {@link
+ * PathfinderGuard} has clamped its ability to break and place: it can route to a shard but can
+ * never mine its way there, which inside a geode is the difference between a collector and a
+ * demolition crew.
+ *
+ * <p>Everything stays inside a leash from the stand position, and the bot walks back afterwards, so
+ * it cannot drift off station over hours of running. Drops it fails to reach are remembered so the
+ * next scan does not immediately pick the same one and livelock on it.
  */
 public final class DropCollector {
 
@@ -59,6 +64,11 @@ public final class DropCollector {
     private int pathTargetX, pathTargetY, pathTargetZ;
     /** Consecutive ticks with a path requested but not running - the "no route" signature. */
     private int pathIdleTicks;
+    /** Consecutive ticks where the distance to the target has not shrunk. */
+    private int noProgressTicks;
+    private double lastDistToTarget = -1;
+    /** Latches once this target has been handed to the pathfinder, to stop the decision flapping. */
+    private boolean escalated;
 
     /**
      * The leash actually in force. Pathed chases get a longer one, because shards fall to whatever
@@ -88,6 +98,9 @@ public final class DropCollector {
         targetEntityId = null;
         chaseTicks = 0;
         stuckTicks = 0;
+        noProgressTicks = 0;
+        lastDistToTarget = -1;
+        escalated = false;
         failReason = "";
     }
 
@@ -112,6 +125,9 @@ public final class DropCollector {
         targetEntityId = null;
         chaseTicks = 0;
         stuckTicks = 0;
+        noProgressTicks = 0;
+        lastDistToTarget = -1;
+        escalated = false;
         return Status.FAILED;
     }
 
@@ -130,7 +146,10 @@ public final class DropCollector {
     public Status tick(final Predicate<ItemStack> wanted, final AutoAmethystConfig.Collection cfg,
                        final double anchorX, final double anchorY, final double anchorZ,
                        final int priority) {
-        final Entity target = resolveTarget(wanted, anchorX, anchorY, anchorZ, cfg.maxDistance);
+        // effectiveLeash, not maxDistance: finding targets with the narrow hand-walk radius would
+        // mean a drop on the level below is never even considered, which defeats the whole point of
+        // having a wider leash for pathed chases.
+        final Entity target = resolveTarget(wanted, anchorX, anchorY, anchorZ, effectiveLeash(cfg));
         if (target == null) {
             // Stop any path we started, or it keeps running underneath the next state and fights
             // whatever asks the pathfinder for something else.
@@ -164,15 +183,37 @@ public final class DropCollector {
         final double dy = target.getY() - CACHE.getPlayerCache().getY();
         final boolean progressing = trackProgress(Math.max(20, cfg.stuckTicks));
 
+        // Escalate on failure to CONVERGE, not merely on failure to move.
+        //
+        // trackProgress only notices a bot that has stopped dead. A bot walking into a wall at an
+        // angle, sliding along it, or circling a shard it cannot step onto is moving the whole time
+        // - so the stuck check never fired, the chase never escalated to the pathfinder, and it ran
+        // out the full hand-walk timeout every time. Distance to the target is the honest measure.
+        final double distToTarget = MathHelper.distance3d(
+            target.getX(), target.getY(), target.getZ(),
+            CACHE.getPlayerCache().getX(), CACHE.getPlayerCache().getY(), CACHE.getPlayerCache().getZ());
+        if (lastDistToTarget >= 0 && distToTarget >= lastDistToTarget - 0.02) {
+            noProgressTicks++;
+        } else {
+            noProgressTicks = 0;
+        }
+        lastDistToTarget = distToTarget;
+
         // A jump clears about 1.25 blocks. Anything higher than that cannot be reached by walking
         // at it, no matter how many times we try - the bot just bounces off the wall below it until
         // the chase times out, even with a ladder a few blocks away. Hand those to the pathfinder,
         // which knows how to climb. Same for a drop well below us, and for a hand walk that has
         // stopped making progress.
-        final boolean needsPath = cfg.usePathfinder
-            && (Math.abs(dy) > cfg.pathfinderHeightThreshold
-                || stuckTicks >= Math.max(1, cfg.escalateToPathTicks));
-        if (needsPath) {
+        // Once a target has been escalated it STAYS escalated until the target changes. Without
+        // that latch the decision flips as the item settles or drifts across the height threshold,
+        // and since giving up on a path resets the repath cooldown, the flapping fired a fresh path
+        // request every other tick - which is the "Calculated path to goal" storm in the log.
+        if (cfg.usePathfinder
+            && (escalated
+                || Math.abs(dy) > cfg.pathfinderHeightThreshold
+                || stuckTicks >= Math.max(1, cfg.escalateToPathTicks)
+                || noProgressTicks >= Math.max(1, cfg.escalateToPathTicks))) {
+            escalated = true;
             return pathToward(target, cfg);
         }
         // Only judge a HAND walk on progress. While the pathfinder has the leg the bot is legitimately
@@ -310,6 +351,11 @@ public final class DropCollector {
         if (next != null) {
             targetEntityId = next.getEntityId();
             chaseTicks = 0;
+            // A new target must start with a clean convergence history, or it inherits the previous
+            // target's distance and looks like it is already failing to make progress.
+            noProgressTicks = 0;
+            lastDistToTarget = -1;
+            escalated = false;
             snapshotPosition();
         }
         return next;
