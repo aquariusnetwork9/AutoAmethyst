@@ -172,6 +172,20 @@ public class AutoAmethystConfig {
         /** Minimum ticks to spend at a waypoint before moving on, even if nothing is mature. */
         public int dwellTicks = 40;
 
+        /**
+         * Stay parked until at least this many clusters are ripe anywhere in the box, instead of
+         * patrolling continuously.
+         *
+         * <p>Growth is the bottleneck, not travel: a face yields a cluster roughly every 2h17m, so
+         * a lap of the rig every few seconds finds nothing new almost every time. Waiting until
+         * there is a worthwhile amount to pick up costs no throughput at all and buys a bot that is
+         * standing still most of the time - less pathfinder churn, less movement for anticheat to
+         * look at, and a log that is readable.
+         *
+         * <p>Set to 0 or 1 to patrol continuously as before.
+         */
+        public int minMatureToPatrol = 2;
+
         /** Horizontal distance in blocks at which a waypoint counts as reached. */
         public double arriveRadius = 0.45;
 

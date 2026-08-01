@@ -63,6 +63,7 @@ public class AutoAmethystCommand extends Command {
                 "column here",
                 "collect on/off",
                 "deposit here|chest here|supply here|haul on/off|on/off|status",
+                "patrolat <clusters>",
                 "why",
                 "debug on/off",
                 "sprint on/off",
@@ -372,6 +373,16 @@ public class AutoAmethystCommand extends Command {
                 PLUGIN_CONFIG.harvest.requireLineOfSight = getToggle(c, "toggle");
                 c.getSource().getEmbed()
                     .title("Line of sight requirement " + toggleStrCaps(PLUGIN_CONFIG.harvest.requireLineOfSight));
+            })))
+            .then(literal("patrolat").then(argument("clusters", integer(0)).executes(c -> {
+                PLUGIN_CONFIG.movement.minMatureToPatrol = getInteger(c, "clusters");
+                c.getSource().getEmbed()
+                    .title("Patrol threshold set")
+                    .description(PLUGIN_CONFIG.movement.minMatureToPatrol > 1
+                        ? "The bot stays parked until " + PLUGIN_CONFIG.movement.minMatureToPatrol
+                          + " clusters are ripe, then walks a lap."
+                        : "The bot patrols continuously.")
+                    .primaryColor();
             })))
             .then(literal("why").executes(c -> {
                 c.getSource().getMultiLineOutput().addAll(module().diagnose());

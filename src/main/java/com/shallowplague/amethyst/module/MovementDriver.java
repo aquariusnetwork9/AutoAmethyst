@@ -129,6 +129,14 @@ public final class MovementDriver {
         // active nor moving. Judging it during that window would fail every single leg instantly.
         final boolean settling = phase == Phase.PATHING && legTicks <= PATH_GRACE_TICKS;
         if (!settling && !trackProgress(Math.max(20, cfg.stuckTicks))) {
+            // A pathing leg that stopped moving has usually just ARRIVED. Baritone parks the bot at
+            // a satisfied goal and leaves the goal set, so isActive() stays true and "stopped
+            // moving" is the normal end state of a successful leg, not a failure. Check where we
+            // actually are before calling it stuck.
+            if (phase == Phase.PATHING && nearEnough()) {
+                if (BARITONE.isActive()) BARITONE.stop();
+                return arrive();
+            }
             return fail("no movement for " + stuckCounter + " ticks");
         }
 
@@ -148,13 +156,13 @@ public final class MovementDriver {
             if (BARITONE.isActive()) BARITONE.stop();
             return arrive();
         }
+        // Judge arrival by where the bot is, not by whether the pathfinder still calls itself busy.
+        // It keeps a satisfied goal set, so isActive() alone never reports the leg as finished.
+        if (legTicks > PATH_GRACE_TICKS && nearEnough()) {
+            if (BARITONE.isActive()) BARITONE.stop();
+            return arrive();
+        }
         if (legTicks > PATH_GRACE_TICKS && !BARITONE.isActive()) {
-            // Pathing ended without landing exactly on the waypoint. If we got near enough, take
-            // it: the recorded block itself may simply not be standable, and reach is 4.5 anyway.
-            if (horizontalDistanceTo(targetX, targetZ) <= 2.0
-                && Math.abs(CACHE.getPlayerCache().getY() - targetY) <= 1.5) {
-                return arrive();
-            }
             return fail("no route to the waypoint - the pathfinder gave up"
                 + " (it cannot break or place, by design; scaffolding is also not routable)");
         }
@@ -271,6 +279,16 @@ public final class MovementDriver {
             .priority(priority);
         if (yaw != null) builder.yaw(yaw);
         INPUTS.submit(builder.build());
+    }
+
+    /**
+     * Close enough to call a pathed leg arrived. Looser than {@link #atTarget} on purpose: the
+     * pathfinder is aiming at a GoalNear, the recorded waypoint block may not be standable at all,
+     * and reach is 4.5 - so standing a block or two off is a success, not a failure.
+     */
+    private boolean nearEnough() {
+        return horizontalDistanceTo(targetX, targetZ) <= 2.0
+            && Math.abs(CACHE.getPlayerCache().getY() - targetY) <= 1.5;
     }
 
     private boolean atTarget(final double arriveRadius) {

@@ -135,6 +135,10 @@ public class AutoAmethystModule extends Module {
     /** Box-relative offset of that nearest block, so logs carry no real coordinates. */
     private int diagNearestDx, diagNearestDy, diagNearestDz;
     private long lastWaypointStartTick = 0;
+    /** True when the whole box was readable during the last census. */
+    private boolean censusReliable = false;
+    /** True while deliberately parked waiting for more clusters to ripen. */
+    private boolean idleWaiting = false;
     private int yieldAtStart = -1;
     private int yieldNow = -1;
     private int yieldBeforeDeposit = 0;
@@ -385,11 +389,22 @@ public class AutoAmethystModule extends Module {
 
         if (reachable.isEmpty()) {
             if (movementMode() == MovementDriver.Mode.STATIONARY) return;
+            // Nothing in reach here. Only bother walking a lap if enough has ripened to make the
+            // trip worth it - growth is the bottleneck, not travel, so patrolling every few seconds
+            // finds nothing new almost every time and just burns pathfinder churn and movement.
+            // Never gated on an unreliable census, or an unloaded box would park the bot forever.
+            final int threshold = PLUGIN_CONFIG.movement.minMatureToPatrol;
+            if (threshold > 1 && censusReliable && matureInBox < threshold) {
+                idleWaiting = true;
+                return;
+            }
+            idleWaiting = false;
             if (++dwellTicks >= Math.max(0, PLUGIN_CONFIG.movement.dwellTicks)) {
                 beginNextWaypoint();
             }
             return;
         }
+        idleWaiting = false;
         dwellTicks = 0;
         final long pos = pickNearestTarget();
         if (pos == Long.MIN_VALUE) {
@@ -606,12 +621,13 @@ public class AutoAmethystModule extends Module {
     private void recountBox() {
         final AutoAmethystConfig.Harvest h = harvest();
         int count = 0;
+        int skippedColumns = 0;
         double nearestSq = Double.MAX_VALUE;
         int nx = 0, ny = 0, nz = 0;
         final double ex = BOT.getX(), ey = BOT.getEyeY(), ez = BOT.getZ();
         for (int x = h.minX; x <= h.maxX; x++) {
             for (int z = h.minZ; z <= h.maxZ; z++) {
-                if (!World.isChunkLoadedBlockPos(x, z)) continue;
+                if (!World.isChunkLoadedBlockPos(x, z)) { skippedColumns++; continue; }
                 for (int y = h.minY; y <= h.maxY; y++) {
                     if (!isHarvestable(World.getBlock(x, y, z))) continue;
                     count++;
@@ -626,6 +642,10 @@ public class AutoAmethystModule extends Module {
             }
         }
         matureInBox = count;
+        // A count taken over unloaded chunks is not evidence of anything. Nothing may act on it -
+        // in particular the "wait until N are ripe" gate must not park the bot forever because the
+        // box happened to be unloaded when it looked.
+        censusReliable = skippedColumns == 0;
         if (count > 0) {
             diagNearestDist = Math.sqrt(nearestSq);
             diagNearestDx = nx - h.minX;
@@ -646,9 +666,14 @@ public class AutoAmethystModule extends Module {
         final List<String> out = new java.util.ArrayList<>();
         out.add("state=" + stateName() + " mode=" + mode() + " movement=" + movementMode());
         if (paused) out.add("PAUSED: " + pauseReason);
-        out.add("mature in box=" + matureInBox
+        out.add("mature in box=" + matureInBox + (censusReliable ? "" : " (UNRELIABLE - box chunks unloaded)")
             + "  found in scan cube=" + diagFoundInCube
             + "  in reach=" + reachable.size());
+        if (idleWaiting) {
+            out.add("=> parked on purpose: waiting for " + PLUGIN_CONFIG.movement.minMatureToPatrol
+                + " clusters to ripen before walking a lap (only " + matureInBox + " ready)."
+                + " Change with 'autoamethyst patrolat <n>'.");
+        }
         out.add("rejected: too far=" + diagRejectedFar
             + "  on cooldown=" + diagRejectedSkipped
             + "  no line of sight=" + diagRejectedNoLos);
