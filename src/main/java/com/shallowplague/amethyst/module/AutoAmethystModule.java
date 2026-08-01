@@ -450,9 +450,23 @@ public class AutoAmethystModule extends Module {
         }
     }
 
+    /**
+     * Pause after a break, then go and pick up what it dropped.
+     *
+     * <p>The cycle is deliberately strictly serial: break one cluster, collect its drops, rescan,
+     * pick the next. Breaking several before collecting means several sets of shards on the floor
+     * at once, scattered over whatever the bot walked past, each with a five minute despawn timer -
+     * and the more that are down at once the more likely some land somewhere awkward. One at a time
+     * costs nothing, because growth is the bottleneck, not the harvesting.
+     */
     private void tickSettle() {
         if (--settleTicks > 0) return;
-        state = State.IDLE;
+        if (PLUGIN_CONFIG.collection.enabled) {
+            state = State.COLLECTING;
+        } else {
+            scanTimer.skip();
+            state = State.IDLE;
+        }
     }
 
     private void tickCollecting() {
@@ -676,6 +690,9 @@ public class AutoAmethystModule extends Module {
         consecutiveFailures = 0;
         recentlyBroken.put(pos, tickCounter);
         matureTargets.rem(pos);
+        // Anchor the collector where the bot was standing when it broke this, so the leash is
+        // centred on where the shards actually landed rather than on some earlier position.
+        setAnchorHere();
         settleTicks = Math.max(1, harvest().interBreakDelayTicks);
         state = State.SETTLE;
         logHarvest(pos);

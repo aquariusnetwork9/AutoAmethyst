@@ -77,13 +77,14 @@ public class AutoAmethystConfig {
         public int scanIntervalTicks = 100;
 
         /**
-         * Wait until this many clusters are ripe before setting off to harvest.
+         * How many clusters must be ripe before the bot sets off.
          *
-         * <p>Growth is the bottleneck, not travel - a face yields a cluster roughly every 2h17m - so
-         * walking across the geode the instant one appears just means more walking for the same
-         * shards. Set to 1 to go as soon as anything is ready.
+         * <p>Defaults to 1: go as soon as anything is ready. The cycle is one cluster at a time
+         * anyway - break it, collect its shards, rescan, repeat - so there is nothing to be gained
+         * by batching, and every shard left on the floor is on a five minute despawn timer. Raise it
+         * only if you would rather the bot stood still more of the time.
          */
-        public int minMatureToHarvest = 2;
+        public int minMatureToHarvest = 1;
 
         /**
          * How often to sweep the whole box to count mature clusters. Statistics only, and the whole
