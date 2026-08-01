@@ -280,6 +280,30 @@ public class AutoAmethystConfig {
         /** Ticks of a stuck hand walk before escalating that chase to the pathfinder. */
         public int escalateToPathTicks = 20;
 
+        /**
+         * Leash for chases the pathfinder is driving, separate from the hand-walk {@link
+         * #maxDistance}. Shards fall to whatever level is below the bot, so a leash tight enough to
+         * keep a hand walk sane is far too tight to collect off another floor of the rig.
+         */
+        public double pathMaxDistance = 16.0;
+
+        /**
+         * Timeout for a chase the pathfinder is driving. Much longer than the hand-walk timeout:
+         * climbing down a ladder, crossing a level and coming back is easily ten seconds, and the
+         * short timeout was abandoning perfectly good trips part way through.
+         */
+        public int pathChaseTimeoutTicks = 400;
+
+        /**
+         * Ticks to wait for the pathfinder to start moving before writing a drop off as unreachable.
+         *
+         * <p>Some shards land where nothing can walk - a gap between the rig and the geode wall, a
+         * ledge with no standable block beside it. The pathfinder answers "No path found" for those
+         * after searching millions of nodes, and without this the bot then stood there for the whole
+         * chase timeout doing nothing. Giving up in a second instead of six is most of the win.
+         */
+        public int pathGiveUpTicks = 40;
+
         /** How close to the stand position counts as "back". */
         public double returnTolerance = 0.6;
     }

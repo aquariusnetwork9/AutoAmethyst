@@ -57,6 +57,16 @@ public final class DropCollector {
     private boolean pathing;
     private int repathCooldown;
     private int pathTargetX, pathTargetY, pathTargetZ;
+    /** Consecutive ticks with a path requested but not running - the "no route" signature. */
+    private int pathIdleTicks;
+
+    /**
+     * The leash actually in force. Pathed chases get a longer one, because shards fall to whatever
+     * level is below the bot and a radius tight enough to keep a hand walk sane cannot reach them.
+     */
+    public static double effectiveLeash(final AutoAmethystConfig.Collection cfg) {
+        return cfg.usePathfinder ? Math.max(cfg.maxDistance, cfg.pathMaxDistance) : cfg.maxDistance;
+    }
 
     /**
      * Drops we could not get to. Without this, a shard that lands somewhere unwalkable - inside the
@@ -129,7 +139,13 @@ public final class DropCollector {
             return Status.DONE;
         }
 
-        if (++chaseTicks > Math.max(20, cfg.chaseTimeoutTicks)) {
+        // A pathed chase gets far longer than a hand walk: climbing down a ladder, crossing a level
+        // and coming back is easily ten seconds, and the hand-walk timeout was cutting good trips
+        // off part way.
+        final int timeout = pathing
+            ? Math.max(40, cfg.pathChaseTimeoutTicks)
+            : Math.max(20, cfg.chaseTimeoutTicks);
+        if (++chaseTicks > timeout) {
             stopPathing();
             return abandonCurrent("gave up chasing a drop after " + chaseTicks + " ticks");
         }
@@ -138,7 +154,7 @@ public final class DropCollector {
         // to wander out of the rig.
         final double distFromAnchor = MathHelper.distance3d(
             target.getX(), target.getY(), target.getZ(), anchorX, anchorY, anchorZ);
-        if (distFromAnchor > cfg.maxDistance) {
+        if (distFromAnchor > effectiveLeash(cfg)) {
             stopPathing();
             targetEntityId = null;
             chaseTicks = 0;
@@ -192,6 +208,20 @@ public final class DropCollector {
         final int by = MathHelper.floorI(target.getY());
         final int bz = MathHelper.floorI(target.getZ());
 
+        // Some shards land where nothing can walk - a gap behind the rig, a ledge with no standable
+        // block beside it. The pathfinder answers "No path found" after searching a couple of
+        // million nodes, and the only visible symptom is the bot standing still. Detect it by the
+        // path simply never starting, and write the drop off in a second rather than burning the
+        // whole chase timeout on it.
+        if (pathing) {
+            if (BARITONE.isActive()) {
+                pathIdleTicks = 0;
+            } else if (++pathIdleTicks > Math.max(10, cfg.pathGiveUpTicks)) {
+                stopPathing();
+                return abandonCurrent("no route to the drop (unreachable without breaking blocks)");
+            }
+        }
+
         if (repathCooldown > 0) {
             repathCooldown--;
         } else if (!BARITONE.isActive() || bx != pathTargetX || by != pathTargetY || bz != pathTargetZ) {
@@ -210,6 +240,7 @@ public final class DropCollector {
         if (!pathing) return;
         pathing = false;
         repathCooldown = 0;
+        pathIdleTicks = 0;
         if (BARITONE.isActive()) BARITONE.stop();
     }
 

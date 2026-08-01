@@ -374,7 +374,7 @@ public class AutoAmethystModule extends Module {
         // to grab without really interrupting anything.
         if (PLUGIN_CONFIG.collection.enabled) {
             final double radius = reachable.isEmpty()
-                ? PLUGIN_CONFIG.collection.maxDistance
+                ? DropCollector.effectiveLeash(PLUGIN_CONFIG.collection)
                 : PLUGIN_CONFIG.collection.opportunisticRadius;
             if (radius > 0
                 && collector.hasWorkNear(this::isOurYield, anchorX, anchorY, anchorZ, radius)) {
