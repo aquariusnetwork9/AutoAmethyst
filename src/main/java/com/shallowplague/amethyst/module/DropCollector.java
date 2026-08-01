@@ -71,6 +71,8 @@ public final class DropCollector {
     private boolean escalated;
     /** Latches when the pathfinder refused this target, so the hand walk gets it instead. */
     private boolean pathRefused;
+    /** Ticks spent walking home, so the return leg can never spin forever. */
+    private int returnTicks;
 
     /**
      * The leash actually in force. Pathed chases get a longer one, because shards fall to whatever
@@ -104,6 +106,7 @@ public final class DropCollector {
         lastDistToTarget = -1;
         escalated = false;
         pathRefused = false;
+        returnTicks = 0;
         failReason = "";
     }
 
@@ -315,10 +318,32 @@ public final class DropCollector {
     public Status tickReturn(final AutoAmethystConfig.Collection cfg, final double anchorX,
                              final double anchorY, final double anchorZ, final int priority) {
         final double dy = anchorY - CACHE.getPlayerCache().getY();
-        if (horizontalDistance(anchorX, anchorZ) <= cfg.returnTolerance
+
+        // The arrival tolerance must never be tighter than the precision of the goal used to get
+        // here. The return paths with GoalNear(anchor, rangeSq 2), which parks the bot up to ~1.41
+        // blocks away - so a 0.6 tolerance can never be satisfied by a pathed return. The goal is
+        // already met, every path completes instantly, and the leg repaths forever: the bot stands
+        // still in RETURNING with "Pathing complete" scrolling past every couple of seconds.
+        //
+        // Precision is not the point here anyway. This leg exists so the bot does not drift off
+        // station over hours; landing a block or two out is entirely fine.
+        final double tolerance = (pathing || pathRefused)
+            ? Math.max(cfg.returnTolerance, 2.0)
+            : cfg.returnTolerance;
+        if (horizontalDistance(anchorX, anchorZ) <= tolerance
             && Math.abs(dy) <= cfg.pathfinderHeightThreshold) {
             reset();
             return Status.DONE;
+        }
+
+        // Never let the walk home run forever. The caller treats a failed return as "re-anchor
+        // where you are and carry on", which is a perfectly good outcome and far better than a bot
+        // that stops harvesting because it cannot get back to an arbitrary spot.
+        if (++returnTicks > Math.max(100, cfg.returnTimeoutTicks)) {
+            failReason = "could not get back to the stand position in "
+                + returnTicks + " ticks; re-anchoring here";
+            reset();
+            return Status.FAILED;
         }
         final boolean progressing = trackProgress(Math.max(20, cfg.stuckTicks));
         final boolean needsPath = cfg.usePathfinder

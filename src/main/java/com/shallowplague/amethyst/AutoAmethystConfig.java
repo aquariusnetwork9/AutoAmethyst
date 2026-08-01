@@ -318,8 +318,17 @@ public class AutoAmethystConfig {
          */
         public int pathGiveUpTicks = 40;
 
-        /** How close to the stand position counts as "back". */
+        /**
+         * How close to the stand position counts as "back".
+         *
+         * <p>Only used for a hand-walked return. A pathed return is judged against at least the
+         * precision of the goal it used, because a tolerance tighter than the goal can never be
+         * satisfied and the leg would repath forever.
+         */
         public double returnTolerance = 0.6;
+
+        /** Give up walking home after this long and just re-anchor where the bot is standing. */
+        public int returnTimeoutTicks = 400;
     }
 
     public final Deposit deposit = new Deposit();
