@@ -245,6 +245,24 @@ public class AutoAmethystConfig {
         /** Ticks of no progress in a chase before trying a jump. */
         public int jumpAfterStuckTicks = 10;
 
+        /**
+         * Hand the chase to the pathfinder when a drop cannot simply be walked and jumped to.
+         *
+         * <p>A jump clears about 1.25 blocks. A shard that landed on a ledge above that is
+         * unreachable by walking at it, and a bot that keeps trying just bounces off the wall until
+         * the chase times out - even when there is a ladder a couple of blocks away. The pathfinder
+         * knows how to use the ladder. This is only safe because {@link
+         * com.shallowplague.amethyst.module.PathfinderGuard} has already clamped its ability to
+         * break or place, so it can route to the drop but never mine its way there.
+         */
+        public boolean usePathfinder = true;
+
+        /** Vertical difference, up or down, beyond which the pathfinder takes the leg. */
+        public double pathfinderHeightThreshold = 1.25;
+
+        /** Ticks of a stuck hand walk before escalating that chase to the pathfinder. */
+        public int escalateToPathTicks = 20;
+
         /** How close to the stand position counts as "back". */
         public double returnTolerance = 0.6;
     }

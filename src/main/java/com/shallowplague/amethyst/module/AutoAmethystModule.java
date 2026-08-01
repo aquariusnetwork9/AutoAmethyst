@@ -424,10 +424,7 @@ public class AutoAmethystModule extends Module {
 
     private void tickReturning() {
         final DropCollector.Status status = collector.tickReturn(
-            anchorX, anchorZ, PLUGIN_CONFIG.collection.returnTolerance,
-            PLUGIN_CONFIG.collection.sneakWhileCollecting,
-            PLUGIN_CONFIG.collection.sprintWhileCollecting, harvest().inputPriority,
-            PLUGIN_CONFIG.collection.stuckTicks);
+            PLUGIN_CONFIG.collection, anchorX, anchorY, anchorZ, harvest().inputPriority);
         switch (status) {
             case RETURNING, CHASING, IDLE -> { }
             case DONE -> {
