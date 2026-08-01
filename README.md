@@ -88,18 +88,29 @@ off rather than chased forever.
    fresh empty one from inventory, carry on
 3. when there is nothing left to deposit: carry every filled shulker to the **storage chest** and
    leave them there
-4. walk back to the stand position it was harvesting from
+4. restock empty shulkers from the **supply chest** if it is running low
+5. walk back to the stand position it was harvesting from
 
-Set the chest by standing next to it and running `deposit chest here` — it finds the nearest
-container within 4 blocks, so you never type a coordinate. Any container works. **The chest is never
-broken**; it is not on the breakable allowlist, and if the chest position ever holds something
-unexpected the run fails with a reason rather than clearing it.
+Set both chests by standing next to them and running `deposit chest here` and `deposit supply here`
+— each finds the nearest container within 4 blocks, so you never type a coordinate. Any container
+works, and **they can be the same block**: filled shulkers go in, empty ones come out, told apart by
+their contents rather than by which chest they are in.
 
-Step 4 is not cosmetic. Without it the bot finishes standing at the chest, re-anchors there, and in
+**Neither chest is ever broken.** They are not on the breakable allowlist, and a chest position that
+holds something unexpected fails the run with a reason rather than being cleared. The bot also
+confirms a block really is a container before right-clicking it, so a stale position cannot have it
+poking at whatever ended up there.
+
+The restock is demand-driven as well as scheduled: if the bot runs out of empties *mid-run* — the
+normal steady state once its carried stock is used up — it walks to the supply chest, takes
+`emptiesPerTrip` of them, comes back and carries on, rather than failing the cycle. Trips are
+budgeted per run so an empty supply chest cannot loop.
+
+Step 5 is not cosmetic. Without it the bot finishes standing at a chest, re-anchors there, and in
 stationary mode never returns to the geode — the farm looks alive and produces nothing.
 
-Keep the bot stocked with empty shulkers. If the inventory fills with *filled* shulkers and no chest
-is set, the module pauses and tells you, rather than looping on a deposit that frees nothing.
+If the inventory fills with *filled* shulkers and no chest is set, the module pauses and tells you,
+rather than looping on a deposit that frees nothing.
 
 > **Transfers use `ClickItem`, not shift-click.** Stock Zenith's `ShiftClick` sends an empty
 > `changedSlots` map — its own source comments flag this as a likely anticheat problem. On a server
@@ -152,8 +163,9 @@ Any leg that stalls fails the leg and pauses the module with a reason, rather th
 4. Put Fortune III pickaxes (**no Silk Touch**) in the inventory.
 5. Stand somewhere clear **outside** the geode and run `autoamethyst deposit here` — that is where
    the working shulker goes. Carry a few empty shulker boxes.
-6. Stand next to your storage chest and run `autoamethyst deposit chest here`, then
-   `autoamethyst deposit on`.
+6. Stand next to your storage chest and run `autoamethyst deposit chest here`. Stand next to a chest
+   of **empty** shulker boxes and run `autoamethyst deposit supply here` (it can be the same chest).
+   Then `autoamethyst deposit on`.
 7. `autoamethyst on`
 
 For a multi-level rig, add stand positions by standing on each and running `autoamethyst waypoint
@@ -179,7 +191,8 @@ column here                 set the scaffolding column
 
 collect on/off              walk onto dropped items
 deposit here                set the shulker position from the bot's position
-deposit chest here          set the storage chest (nearest container within 4 blocks)
+deposit chest here          set the storage chest for filled shulkers
+deposit supply here         set the chest to restock empty shulkers from
 deposit haul on/off         carry filled shulkers to the chest
 deposit on/off|status       shulker deposit cycle
 

@@ -151,6 +151,18 @@ public final class HarvestPolicy {
         return block != null && block.blockTags().contains(BlockTags.SHULKER_BOXES);
     }
 
+    /**
+     * A block worth right-clicking to open. Checked before any container interaction so a stale or
+     * mistyped chest position makes the bot fail with a reason rather than right-click whatever
+     * happens to be standing there.
+     */
+    public static boolean isContainerBlock(final @Nullable Block block) {
+        if (block == null) return false;
+        if (isShulkerBlock(block)) return true;
+        final String name = block.name();
+        return name.endsWith("chest") || name.equals("barrel");
+    }
+
     public static boolean isShulkerItem(final @Nullable ItemStack stack) {
         final ItemData data = itemData(stack);
         return data != null && data.name().endsWith("shulker_box");

@@ -84,6 +84,10 @@ public final class DepositCycle {
         CHEST_OPEN,
         CHEST_TRANSFER,
         CHEST_CLOSE,
+        SUPPLY_APPROACH,
+        SUPPLY_OPEN,
+        SUPPLY_TAKE,
+        SUPPLY_CLOSE,
         RETURN
     }
 
@@ -103,6 +107,9 @@ public final class DepositCycle {
     private int reopens = 0;
     private int shulkersStored = 0;
     private int fullShulkersBeforeChest = 0;
+    private int supplyTrips = 0;
+    /** Where to go once a restock trip finishes - it is reached from two different places. */
+    private Phase afterSupply = Phase.RETURN;
     private String failReason = "";
 
     /** Where the harvest loop was standing, so the run can put the bot back afterwards. */
@@ -136,6 +143,8 @@ public final class DepositCycle {
         placeAttempts = 0;
         repathCooldown = 0;
         reopens = 0;
+        supplyTrips = 0;
+        afterSupply = Phase.RETURN;
         failReason = "";
         breaker.reset();
         shulkerCollector.reset();
@@ -166,7 +175,12 @@ public final class DepositCycle {
             case CHEST_OPEN -> open(cfg.chestX, cfg.chestY, cfg.chestZ, cfg, reach, requireLineOfSight,
                                     priority, Phase.CHEST_TRANSFER);
             case CHEST_TRANSFER -> transfer(DepositCycle::isFullShulkerItem, cfg, Phase.CHEST_CLOSE, false);
-            case CHEST_CLOSE -> close(Phase.RETURN);
+            case CHEST_CLOSE -> closeThenMaybeRestock(cfg);
+            case SUPPLY_APPROACH -> approach(cfg.supplyX, cfg.supplyY, cfg.supplyZ, cfg, reach, Phase.SUPPLY_OPEN);
+            case SUPPLY_OPEN -> open(cfg.supplyX, cfg.supplyY, cfg.supplyZ, cfg, reach, requireLineOfSight,
+                                     priority, Phase.SUPPLY_TAKE);
+            case SUPPLY_TAKE -> takeEmptyShulkers(cfg);
+            case SUPPLY_CLOSE -> close(afterSupply);
             case RETURN -> tickReturn(cfg, reach);
             case IDLE -> Status.DONE;
         };
@@ -213,6 +227,12 @@ public final class DepositCycle {
             stallCount = 0;
             advance(next);
             return Status.BUSY;
+        }
+        // Confirm it is actually a container before right-clicking. A stale or mistyped position
+        // would otherwise have the bot repeatedly right-click whatever is standing there.
+        final Block at = World.getBlock(x, y, z);
+        if (!HarvestPolicy.isContainerBlock(at)) {
+            return fail("expected a container but found " + (at.isAir() ? "nothing" : at.name()));
         }
         final Position centre = World.blockInteractionCenter(x, y, z);
         final Vector2f rot = RotationHelper.rotationTo(centre.x(), centre.y(), centre.z());
@@ -318,6 +338,26 @@ public final class DepositCycle {
         return Status.BUSY;
     }
 
+    /**
+     * Closes the storage chest, then decides whether to detour for empty shulkers.
+     *
+     * <p>The decision is deliberately made only once the window is actually shut, not computed
+     * alongside the close: this phase runs every tick until the container closes, and evaluating
+     * the decision each time would burn the whole restock-trip budget in a couple of ticks.
+     */
+    private Status closeThenMaybeRestock(final AutoAmethystConfig.Deposit cfg) {
+        if (openContainerId() != 0) {
+            INVENTORY.submit(InventoryActionRequest.builder()
+                .owner(owner)
+                .actions(new CloseContainer())
+                .priority(0)
+                .build());
+            return Status.BUSY;
+        }
+        advance(startSupplyTripIfNeeded(cfg, Phase.RETURN));
+        return Status.BUSY;
+    }
+
     // ------------------------------------------------------------------ shulker phases
 
     private Status tickEnsureContainer(final AutoAmethystConfig.Deposit cfg) {
@@ -354,7 +394,19 @@ public final class DepositCycle {
         }
         final int slot = findEmptyShulkerSlot();
         if (slot < 0) {
-            return fail("no empty shulker box in inventory to place");
+            // Out of empties mid-run. Go and get more rather than failing the whole cycle - this is
+            // the normal steady state once the carried stock is used up.
+            if (cfg.supplySet && supplyTrips < Math.max(1, cfg.maxSupplyTrips)) {
+                supplyTrips++;
+                // come back via APPROACH so the bot walks to the deposit spot before placing
+                afterSupply = Phase.APPROACH;
+                advance(Phase.SUPPLY_APPROACH);
+                return Status.BUSY;
+            }
+            return fail(cfg.supplySet
+                ? "the supply chest has no empty shulker boxes left"
+                : "no empty shulker box to place, and no supply chest is set "
+                  + "(stand by one and run 'deposit supply here')");
         }
         final ItemStack stack = CACHE.getPlayerCache().getPlayerInventory().get(slot);
         final ItemData data = ItemRegistry.REGISTRY.get(stack.getId());
@@ -415,6 +467,89 @@ public final class DepositCycle {
             case FAILED -> fail("could not collect the broken shulker: " + shulkerCollector.failReason());
             case IDLE -> Status.BUSY;
         };
+    }
+
+    // ------------------------------------------------------------------ supply chest
+
+    /**
+     * Decides whether to detour to the supply chest before {@code next}, and sets up the return.
+     *
+     * <p>Called after the storage chest visit, which is the natural moment to restock: the bot has
+     * just handed over the filled shulkers and is already away from the geode.
+     */
+    private Phase startSupplyTripIfNeeded(final AutoAmethystConfig.Deposit cfg, final Phase next) {
+        if (!cfg.supplySet) return next;
+        if (countEmptyShulkers() >= Math.max(1, cfg.minEmptyShulkers)) return next;
+        if (supplyTrips >= Math.max(1, cfg.maxSupplyTrips)) return next;
+        supplyTrips++;
+        afterSupply = next;
+        return Phase.SUPPLY_APPROACH;
+    }
+
+    /**
+     * Pulls empty shulkers out of the open supply chest and into the inventory.
+     *
+     * <p>The mirror image of {@link #transfer}: container half to player half, two clicks per stack
+     * (pick up, put down), paced the same way. Stops once the bot is carrying {@code emptiesPerTrip}
+     * or the chest has no more empties to give.
+     */
+    private Status takeEmptyShulkers(final AutoAmethystConfig.Deposit cfg) {
+        final Container container = CACHE.getPlayerCache().getInventoryCache().getOpenContainer();
+        if (container.getContainerId() == 0) {
+            if (++reopens > MAX_REOPENS) {
+                return fail("the supply chest window kept closing (" + (reopens - 1) + " re-opens)");
+            }
+            advance(Phase.SUPPLY_OPEN);
+            return Status.BUSY;
+        }
+
+        final int playerStart = container.getSize() - 36;
+
+        // Anything in hand goes into the inventory before we pick up more.
+        final ItemStack mouse = CACHE.getPlayerCache().getInventoryCache().getMouseStack();
+        if (mouse != Container.EMPTY_STACK) {
+            final int dest = findFreePlayerSlot(container);
+            if (dest < 0) {
+                // No room to carry it; give it back to the chest rather than dropping it.
+                final int back = findDestinationSlot(container, mouse);
+                if (back < 0) return fail("no room in the inventory or the supply chest for the shulker in hand");
+                click(container.getContainerId(), back, cfg);
+                return Status.BUSY;
+            }
+            click(container.getContainerId(), dest, cfg);
+            return Status.BUSY;
+        }
+
+        if (countEmptyShulkers() >= Math.max(1, cfg.emptiesPerTrip)) {
+            advance(Phase.SUPPLY_CLOSE);
+            return Status.BUSY;
+        }
+        if (findFreePlayerSlot(container) < 0) {
+            // carrying all we can
+            advance(Phase.SUPPLY_CLOSE);
+            return Status.BUSY;
+        }
+
+        final int source = findContainerSlotMatching(container, playerStart, DepositCycle::isEmptyShulkerItem);
+        if (source < 0) {
+            // Chest has none left. Not fatal on its own - PLACE_SHULKER decides whether the bot can
+            // carry on with what it already has.
+            advance(Phase.SUPPLY_CLOSE);
+            return Status.BUSY;
+        }
+
+        final int carried = countEmptyShulkers();
+        if (lastTransferCount >= 0 && carried <= lastTransferCount) {
+            if (++stallCount > Math.max(3, cfg.maxStalledSteps)) {
+                return fail("could not take shulkers from the supply chest (server rejecting clicks?)");
+            }
+        } else {
+            stallCount = 0;
+        }
+        lastTransferCount = carried;
+
+        click(container.getContainerId(), source, cfg);
+        return Status.BUSY;
     }
 
     // ------------------------------------------------------------------ chest trip / return
@@ -545,6 +680,29 @@ public final class DepositCycle {
             if (isFullShulkerItem(inv.get(slot))) count++;
         }
         return count;
+    }
+
+    private static int countEmptyShulkers() {
+        final var inv = CACHE.getPlayerCache().getPlayerInventory();
+        int count = 0;
+        for (int slot = 9; slot <= 44; slot++) {
+            if (isEmptyShulkerItem(inv.get(slot))) count++;
+        }
+        return count;
+    }
+
+    public static boolean isEmptyShulkerItem(final @Nullable ItemStack stack) {
+        return HarvestPolicy.isShulkerItem(stack) && shulkerIsEmpty(stack);
+    }
+
+    private static int findContainerSlotMatching(final Container container, final int playerStart,
+                                                 final Predicate<ItemStack> what) {
+        for (int i = 0; i < playerStart; i++) {
+            final ItemStack stack = container.getItemStack(i);
+            if (stack == Container.EMPTY_STACK) continue;
+            if (what.test(stack)) return i;
+        }
+        return -1;
     }
 
     /**

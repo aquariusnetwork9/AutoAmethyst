@@ -5,7 +5,6 @@ import com.shallowplague.amethyst.module.AutoAmethystModule;
 import com.shallowplague.amethyst.module.HarvestPolicy;
 import com.shallowplague.amethyst.module.MovementDriver;
 import com.zenith.feature.player.World;
-import com.zenith.mc.block.Block;
 import org.jspecify.annotations.Nullable;
 import com.zenith.Proxy;
 import com.zenith.command.api.Command;
@@ -63,7 +62,7 @@ public class AutoAmethystCommand extends Command {
                 "waypoint add|clear|list",
                 "column here",
                 "collect on/off",
-                "deposit here|on/off|status",
+                "deposit here|chest here|supply here|haul on/off|on/off|status",
                 "reach <blocks>",
                 "delay <ticks>",
                 "los on/off",
@@ -249,6 +248,32 @@ public class AutoAmethystCommand extends Command {
                         .primaryColor();
                     return OK;
                 })))
+                .then(literal("supply").then(literal("here").executes(c -> {
+                    if (!connected()) {
+                        c.getSource().getEmbed().title("Not connected").errorColor();
+                        return ERROR;
+                    }
+                    final int[] target = findContainerNearby();
+                    if (target == null) {
+                        c.getSource().getEmbed()
+                            .title("No container found")
+                            .description("Stand next to the chest of empty shulkers (within 4 blocks) "
+                                + "and run this again.")
+                            .errorColor();
+                        return ERROR;
+                    }
+                    PLUGIN_CONFIG.deposit.supplyX = target[0];
+                    PLUGIN_CONFIG.deposit.supplyY = target[1];
+                    PLUGIN_CONFIG.deposit.supplyZ = target[2];
+                    PLUGIN_CONFIG.deposit.supplySet = true;
+                    module().requestReload();
+                    c.getSource().getEmbed()
+                        .title("Supply chest set")
+                        .description("Keep it stocked with empty shulker boxes. It may be the same "
+                            + "chest as the storage chest - full ones go in, empty ones come out.")
+                        .primaryColor();
+                    return OK;
+                })))
                 .then(literal("haul").then(argument("toggle", toggle()).executes(c -> {
                     PLUGIN_CONFIG.deposit.haulToChest = getToggle(c, "toggle");
                     c.getSource().getEmbed()
@@ -260,6 +285,7 @@ public class AutoAmethystCommand extends Command {
                         .addField("Enabled", toggleStr(PLUGIN_CONFIG.deposit.enabled))
                         .addField("Shulker position", PLUGIN_CONFIG.deposit.posSet ? "set" : "not set")
                         .addField("Storage chest", PLUGIN_CONFIG.deposit.chestSet ? "set" : "not set")
+                        .addField("Supply chest", PLUGIN_CONFIG.deposit.supplySet ? "set" : "not set")
                         .addField("Haul to chest", toggleStr(PLUGIN_CONFIG.deposit.haulToChest))
                         .addField("Trigger", "<= " + PLUGIN_CONFIG.deposit.triggerFreeSlots + " free slots")
                         .addField("Replace when full", toggleStr(PLUGIN_CONFIG.deposit.replaceWhenFull))
@@ -417,7 +443,7 @@ public class AutoAmethystCommand extends Command {
                 for (int dz = -radius; dz <= radius; dz++) {
                     final int x = px + dx, y = py + dy, z = pz + dz;
                     if (!World.isChunkLoadedBlockPos(x, z)) continue;
-                    if (!isContainerBlock(World.getBlock(x, y, z))) continue;
+                    if (!HarvestPolicy.isContainerBlock(World.getBlock(x, y, z))) continue;
                     final double dist = (double) dx * dx + (double) dy * dy + (double) dz * dz;
                     if (dist < bestDist) {
                         bestDist = dist;
@@ -427,12 +453,6 @@ public class AutoAmethystCommand extends Command {
             }
         }
         return best;
-    }
-
-    private static boolean isContainerBlock(final Block block) {
-        if (HarvestPolicy.isShulkerBlock(block)) return true;
-        final String name = block.name();
-        return name.endsWith("chest") || name.equals("barrel");
     }
 
     private static String currentBlockPosString() {

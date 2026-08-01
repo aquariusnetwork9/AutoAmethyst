@@ -252,6 +252,28 @@ public class AutoAmethystConfig {
         public int chestZ = 0;
 
         /**
+         * Chest holding <b>empty</b> shulker boxes to restock from. Set with
+         * {@code autoamethyst deposit supply here}. Without this the bot can only ever place the
+         * empties it happens to be carrying, so the farm stops the moment it runs out.
+         *
+         * <p>May be the same block as the storage chest: filled shulkers go in, empty ones come
+         * out, and the two are told apart by their contents rather than by which chest they are in.
+         */
+        public boolean supplySet = false;
+        public int supplyX = 0;
+        public int supplyY = 0;
+        public int supplyZ = 0;
+
+        /** How many empty shulkers to pick up per restock trip, so it is not one trip per shulker. */
+        public int emptiesPerTrip = 3;
+
+        /** Restock when carrying fewer empties than this after visiting the storage chest. */
+        public int minEmptyShulkers = 2;
+
+        /** Restock trips allowed per deposit run before giving up on the supply chest. */
+        public int maxSupplyTrips = 2;
+
+        /**
          * How close counts as "back at the stand position" when the run walks the bot home. The
          * return leg exists because a bot that finishes a deposit standing at the chest would
          * re-anchor there and, in stationary mode, never harvest again.
