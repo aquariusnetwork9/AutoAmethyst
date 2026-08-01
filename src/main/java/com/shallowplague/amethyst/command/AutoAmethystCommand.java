@@ -13,6 +13,8 @@ import com.zenith.command.api.CommandUsage;
 import com.zenith.discord.Embed;
 import com.zenith.util.math.MathHelper;
 
+import static com.mojang.brigadier.arguments.DoubleArgumentType.doubleArg;
+import static com.mojang.brigadier.arguments.DoubleArgumentType.getDouble;
 import static com.mojang.brigadier.arguments.IntegerArgumentType.getInteger;
 import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
 import static com.mojang.brigadier.arguments.StringArgumentType.getString;
@@ -42,9 +44,12 @@ public class AutoAmethystCommand extends Command {
 
                 Set the geode box by standing at two opposite corners of the interior and running
                 'box corner1' then 'box corner2'. Only amethyst_cluster blocks inside that box are
-                ever broken.
+                ever broken - never budding amethyst, and never anything else.
 
-                Movement modes:
+                The bot scans the whole box on a timer, walks straight to the nearest ripe cluster,
+                breaks it, collects what it dropped, then scans again. One cluster at a time, so
+                shards are never left lying around while it moves on. Set an optional parking spot
+                with 'home'.
                 """)
             .usageLines(
                 "on/off",
@@ -54,6 +59,8 @@ public class AutoAmethystCommand extends Command {
                 "home | home clear",
                 "ripeat <clusters>",
                 "scanevery <ticks>",
+                "walk radius <blocks>",
+                "walk height <blocks>",
                 "harvest shards|silk",
                 "buds protect|allow",
                 "stage cluster|large|medium|small on/off",
@@ -140,6 +147,30 @@ public class AutoAmethystCommand extends Command {
                         + "bottleneck, so waiting costs no throughput.")
                     .primaryColor();
             })))
+            // Live tuning for the direct walk. These need to be commands rather than config
+            // defaults: an existing plugin config keeps its stored value for every field it already
+            // has, and the proxy rewrites that file from memory on shutdown - so editing the JSON
+            // and restarting silently reverts, and changing the Java default does nothing at all to
+            // a bot that has already run once.
+            .then(literal("walk")
+                .then(literal("radius").then(argument("blocks", doubleArg(1.0, 12.0)).executes(c -> {
+                    PLUGIN_CONFIG.collection.nudgeRadius = getDouble(c, "blocks");
+                    c.getSource().getEmbed()
+                        .title("Direct walk radius set")
+                        .description("The bot walks straight at any drop within "
+                            + PLUGIN_CONFIG.collection.nudgeRadius + " blocks horizontally instead "
+                            + "of asking the pathfinder, which will not stand on budding amethyst.")
+                        .primaryColor();
+                })))
+                .then(literal("height").then(argument("blocks", doubleArg(0.5, 8.0)).executes(c -> {
+                    PLUGIN_CONFIG.collection.nudgeHeight = getDouble(c, "blocks");
+                    c.getSource().getEmbed()
+                        .title("Direct walk height set")
+                        .description("Drops within " + PLUGIN_CONFIG.collection.nudgeHeight
+                            + " blocks above or below are walked at directly. Shards fall to "
+                            + "whatever level is below, so a tight value here strands them.")
+                        .primaryColor();
+                }))))
             .then(literal("scanevery").then(argument("ticks", integer(20)).executes(c -> {
                 PLUGIN_CONFIG.harvest.scanIntervalTicks = getInteger(c, "ticks");
                 c.getSource().getEmbed()
