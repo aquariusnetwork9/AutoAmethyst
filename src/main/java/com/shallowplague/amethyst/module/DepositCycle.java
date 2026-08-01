@@ -447,9 +447,9 @@ public final class DepositCycle {
         collectCfg.chaseTimeoutTicks = cfg.collectTimeoutTicks;
 
         final DropCollector.Status status = shulkerCollector.tick(
-            HarvestPolicy::isShulkerItem, collectCfg, cfg.x + 0.5, cfg.y + 0.5, cfg.z + 0.5, priority);
+            HarvestPolicy::isShulkerItem, collectCfg, cfg.x + 0.5, cfg.y + 0.5, cfg.z + 0.5);
         return switch (status) {
-            case CHASING, RETURNING -> Status.BUSY;
+            case CHASING -> Status.BUSY;
             case DONE -> {
                 // nothing left to chase; give the server a moment to actually hand the shulker
                 // over before we look for a spare to put down
@@ -459,7 +459,6 @@ public final class DepositCycle {
                 yield Status.BUSY;
             }
             case FAILED -> fail("could not collect the broken shulker: " + shulkerCollector.failReason());
-            case IDLE -> Status.BUSY;
         };
     }
 

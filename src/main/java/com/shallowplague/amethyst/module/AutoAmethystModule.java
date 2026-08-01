@@ -73,23 +73,31 @@ public class AutoAmethystModule extends Module {
     /** Refuse to scan an absurd box; a geode interior is tens of blocks across, not hundreds. */
     private static final int MAX_BOX_VOLUME = 262_144; // 64^3
 
-    private enum State { SCAN, ENGAGE, SETTLE, COLLECTING, RETURNING, DEPOSITING, MOVING }
+    private enum State { IDLE, TRAVEL, ENGAGE, SETTLE, COLLECTING, DEPOSITING, GOING_HOME }
 
     private final Timer scanTimer = Timers.tickTimer();
-    private final Timer censusTimer = Timers.tickTimer();
-    private final MovementDriver mover = new MovementDriver(this);
+    private final Travel travel = new Travel();
     private final BreakDriver breaker = new BreakDriver();
     private final DropCollector collector = new DropCollector(this);
     private final DepositCycle depositCycle = new DepositCycle(this);
     private final PathfinderGuard pathGuard = new PathfinderGuard(PLUGIN_CONFIG.internal);
 
-    private State state = State.SCAN;
+    private State state = State.IDLE;
+    /** Cluster the bot is currently walking to or breaking. */
+    private long currentTarget = Long.MIN_VALUE;
     private boolean paused = false;
     private String pauseReason = "";
     private volatile boolean reloadRequested = false;
 
-    /** Candidate harvest positions currently within reach, packed via {@link BlockPos#asLong}. */
-    private final LongArrayList reachable = new LongArrayList();
+    /**
+     * Every ripe cluster in the whole box, nearest first, packed via {@link BlockPos#asLong}.
+     *
+     * <p>The entire box is scanned, not just what is within reach. A geode is a couple of chunks
+     * across, so scanning all of it costs nothing and means the bot always knows where every ripe
+     * cluster is - which is what lets it walk straight to one instead of following a route past
+     * places it hopes something has grown.
+     */
+    private final LongArrayList matureTargets = new LongArrayList();
     /** pos -> tick at which the position becomes eligible again. */
     private final Map<Long, Long> skipUntil = new HashMap<>();
     /** pos -> tick at which we believed we broke it, for anticheat revert detection. */
@@ -100,11 +108,6 @@ public class AutoAmethystModule extends Module {
     private int toolWaitTicks = 0;
     /** Consecutive ticks with no usable pickaxe, so a momentary desync cannot latch a pause. */
     private int noToolTicks = 0;
-    private int dwellTicks = 0;
-    private int waypointIndex = 0;
-    /** Consecutive unreachable waypoints, so one bad one skips instead of stopping the farm. */
-    private int failedWaypoints = 0;
-    private boolean visitedAnyWaypoint = false;
     private int consecutiveFailures = 0;
 
     /** Stand position the collector is leashed to, so the bot cannot drift over hours. */
@@ -134,9 +137,8 @@ public class AutoAmethystModule extends Module {
     private double diagNearestDist = -1;
     /** Box-relative offset of that nearest block, so logs carry no real coordinates. */
     private int diagNearestDx, diagNearestDy, diagNearestDz;
-    private long lastWaypointStartTick = 0;
-    /** True when the whole box was readable during the last census. */
-    private boolean censusReliable = false;
+    /** True when the whole box was readable during the last scan. */
+    private boolean scanReliable = false;
     /** True while deliberately parked waiting for more clusters to ripen. */
     private boolean idleWaiting = false;
     private int yieldAtStart = -1;
@@ -167,8 +169,7 @@ public class AutoAmethystModule extends Module {
         yieldAtStart = -1;
         breaks = skipped = reverts = toolSwaps = deposits = 0;
         depositedTotal = 0;
-        info("Enabled. Harvest mode: {}, movement: {}, pathfinder break/place clamped off",
-            mode(), movementMode());
+        info("Enabled. Harvest mode: {}, pathfinder break/place clamped off", mode());
         if (!PLUGIN_CONFIG.harvest.protectBuds) {
             warn("Bud protection is DISABLED - immature buds can be broken. "
                 + "Each one throws away up to ~2h17m of growth on that face.");
@@ -177,7 +178,7 @@ public class AutoAmethystModule extends Module {
 
     @Override
     public void onDisable() {
-        mover.reset();
+        travel.stop();
         collector.reset();
         depositCycle.reset();
         breaker.reset();
@@ -190,7 +191,7 @@ public class AutoAmethystModule extends Module {
     }
 
     private void onBotStopped(final ClientBotTick.Stopped event) {
-        mover.reset();
+        travel.stop();
         collector.reset();
         depositCycle.reset();
         breaker.reset();
@@ -203,18 +204,16 @@ public class AutoAmethystModule extends Module {
     }
 
     private void resetRuntime() {
-        state = State.SCAN;
+        state = State.IDLE;
         paused = false;
         pauseReason = "";
         settleTicks = 0;
         toolWaitTicks = 0;
         noToolTicks = 0;
-        dwellTicks = 0;
-        visitedAnyWaypoint = false;
         consecutiveFailures = 0;
-        failedWaypoints = 0;
         anchorSet = false;
-        reachable.clear();
+        matureTargets.clear();
+        travel.stop();
         skipUntil.clear();
         recentlyBroken.clear();
         breaker.reset();
@@ -227,10 +226,6 @@ public class AutoAmethystModule extends Module {
 
     private HarvestPolicy.Mode mode() {
         return HarvestPolicy.parseMode(PLUGIN_CONFIG.harvest.mode);
-    }
-
-    private MovementDriver.Mode movementMode() {
-        return MovementDriver.parseMode(PLUGIN_CONFIG.movement.mode);
     }
 
     /** The allowlist used for every harvest break. Bound to the current mode and config. */
@@ -248,7 +243,7 @@ public class AutoAmethystModule extends Module {
         tickCounter++;
         if (reloadRequested) {
             reloadRequested = false;
-            mover.reset();
+            travel.stop();
             collector.reset();
             depositCycle.reset();
             breaker.reset();
@@ -289,13 +284,13 @@ public class AutoAmethystModule extends Module {
 
         try {
             switch (state) {
-                case SCAN -> tickScan();
+                case IDLE -> tickIdle();
+                case TRAVEL -> tickTravel();
                 case ENGAGE -> tickEngage();
                 case SETTLE -> tickSettle();
                 case COLLECTING -> tickCollecting();
-                case RETURNING -> tickReturning();
                 case DEPOSITING -> tickDepositing();
-                case MOVING -> tickMoving();
+                case GOING_HOME -> tickGoingHome();
             }
         } catch (final Exception e) {
             error("Unhandled error in harvest tick, pausing", e);
@@ -332,11 +327,6 @@ public class AutoAmethystModule extends Module {
             pause("geode box is " + volume + " blocks, over the " + MAX_BOX_VOLUME + " limit");
             return false;
         }
-        final MovementDriver.Mode m = movementMode();
-        if (m != MovementDriver.Mode.STATIONARY && PLUGIN_CONFIG.movement.waypoints.isEmpty()) {
-            pause("movement mode " + m + " needs at least one waypoint");
-            return false;
-        }
         if (PLUGIN_CONFIG.deposit.enabled && !PLUGIN_CONFIG.deposit.posSet) {
             pause("deposit is on but no position is set - stand at the shulker and run 'deposit here'");
             return false;
@@ -346,79 +336,98 @@ public class AutoAmethystModule extends Module {
 
     // ------------------------------------------------------------------ states
 
-    private void tickScan() {
+    /**
+     * Parked. Scan the whole box on a timer and decide what, if anything, is worth doing.
+     *
+     * <p>Order matters: deposit before harvesting (a full inventory makes harvesting pointless),
+     * then collect what is already on the floor, then go break something, then go home.
+     */
+    private void tickIdle() {
         if (!ensureTool()) return;
 
         if (shouldDeposit()) {
             yieldBeforeDeposit = countYield();
-            // The deposit run does its own pathing, so make sure a waypoint path is not still
-            // running underneath it and fighting for the same pathfinder.
-            mover.reset();
-            // Hand it the stand position so it can walk the bot back afterwards. Without that the
-            // bot finishes standing at the chest and, in stationary mode, never returns to the geode.
+            travel.stop();
             depositCycle.begin(
                 MathHelper.floorI(anchorX), MathHelper.floorI(anchorY), MathHelper.floorI(anchorZ));
             state = State.DEPOSITING;
             return;
         }
 
-        if (scanTimer.tick(Math.max(1, harvest().rescanIntervalTicks))) {
-            rescan();
+        if (scanTimer.tick(Math.max(20, harvest().scanIntervalTicks))) {
+            fullScan();
         }
 
-        // Collect, but never at the expense of harvesting.
-        //
-        // This used to run before the harvest check, so any drop within the leash took priority over
-        // breaking. In a real geode a fair number of shards land somewhere the bot cannot get to -
-        // inside the rig, under the floor, on the far side of a wall - and each one costs a full
-        // chase timeout. With 200+ mature clusters standing there, the bot spent all its time
-        // failing to reach shards and almost none of it harvesting.
-        //
-        // So: only chase when there is nothing to break in reach, or when the drop is close enough
-        // to grab without really interrupting anything.
-        if (PLUGIN_CONFIG.collection.enabled) {
-            final double radius = reachable.isEmpty()
-                ? DropCollector.effectiveLeash(PLUGIN_CONFIG.collection)
-                : PLUGIN_CONFIG.collection.opportunisticRadius;
-            if (radius > 0
-                && collector.hasWorkNear(this::isOurYield, anchorX, anchorY, anchorZ, radius)) {
-                state = State.COLLECTING;
-                return;
-            }
+        if (PLUGIN_CONFIG.collection.enabled
+            && collector.hasWorkNear(this::isOurYield, anchorX, anchorY, anchorZ,
+                                     PLUGIN_CONFIG.collection.maxDistance)) {
+            state = State.COLLECTING;
+            return;
         }
 
-        if (reachable.isEmpty()) {
-            if (movementMode() == MovementDriver.Mode.STATIONARY) return;
-            // Nothing in reach here. Only bother walking a lap if enough has ripened to make the
-            // trip worth it - growth is the bottleneck, not travel, so patrolling every few seconds
-            // finds nothing new almost every time and just burns pathfinder churn and movement.
-            // Never gated on an unreliable census, or an unloaded box would park the bot forever.
-            final int threshold = PLUGIN_CONFIG.movement.minMatureToPatrol;
-            if (threshold > 1 && censusReliable && matureInBox < threshold) {
-                idleWaiting = true;
-                return;
-            }
-            idleWaiting = false;
-            if (++dwellTicks >= Math.max(0, PLUGIN_CONFIG.movement.dwellTicks)) {
-                beginNextWaypoint();
-            }
+        // Wait until enough has ripened to be worth walking for. Growth is the bottleneck, not
+        // travel, so setting off for a single cluster the moment it appears just means more walking
+        // for the same shards. Never gated on a scan that could not read the box.
+        final int threshold = Math.max(1, harvest().minMatureToHarvest);
+        if (matureTargets.isEmpty() || (scanReliable && matureTargets.size() < threshold)) {
+            idleWaiting = !matureTargets.isEmpty();
+            goHomeIfIdle();
             return;
         }
         idleWaiting = false;
-        dwellTicks = 0;
-        final long pos = pickNearestTarget();
+
+        final long pos = nextTarget();
         if (pos == Long.MIN_VALUE) {
-            // Every candidate was rejected. This used to clear the list silently, which made the
-            // status read "in reach: 0" with "skipped: 0" and gave no hint that anything had been
-            // considered at all - a line-of-sight problem was indistinguishable from an empty geode.
-            if (diagRejectedNoLos > 0) {
-                debug("Rejected all {} in-reach targets: no line of sight from here", diagRejectedNoLos);
-            }
-            reachable.clear();
+            goHomeIfIdle();
             return;
         }
-        breaker.begin(BlockPos.getX(pos), BlockPos.getY(pos), BlockPos.getZ(pos));
-        state = State.ENGAGE;
+        currentTarget = pos;
+        final int x = BlockPos.getX(pos), y = BlockPos.getY(pos), z = BlockPos.getZ(pos);
+        if (inReachWithSight(x, y, z)) {
+            breaker.begin(x, y, z);
+            state = State.ENGAGE;
+        } else {
+            travel.begin(x, y, z);
+            state = State.TRAVEL;
+        }
+    }
+
+    /** Walking to a cluster. Baritone owns the route; we only decide when we have arrived. */
+    private void tickTravel() {
+        final int x = BlockPos.getX(currentTarget);
+        final int y = BlockPos.getY(currentTarget);
+        final int z = BlockPos.getZ(currentTarget);
+
+        // It may have been broken by someone else, or reverted, while we walked.
+        if (World.isChunkLoadedBlockPos(x, z) && !isHarvestable(World.getBlock(x, y, z))) {
+            travel.stop();
+            matureTargets.rem(currentTarget);
+            state = State.IDLE;
+            return;
+        }
+        if (inReachWithSight(x, y, z)) {
+            travel.stop();
+            breaker.begin(x, y, z);
+            state = State.ENGAGE;
+            return;
+        }
+
+        // Arrive a little inside reach so the line-of-sight check has room to succeed.
+        final Travel.Status status = travel.tick(PLUGIN_CONFIG.movement, effectiveReach() - 0.5);
+        switch (status) {
+            case BUSY -> { }
+            case ARRIVED -> {
+                if (inReachWithSight(x, y, z)) {
+                    breaker.begin(x, y, z);
+                    state = State.ENGAGE;
+                } else {
+                    // Close, but no clean shot from where the pathfinder put us. Park it on the
+                    // skip cooldown and move to the next one rather than shuffling about.
+                    skipTarget(currentTarget, "arrived but still no clean line of sight");
+                }
+            }
+            case FAILED -> skipTarget(currentTarget, travel.failReason());
+        }
     }
 
     private void tickEngage() {
@@ -431,8 +440,6 @@ public class AutoAmethystModule extends Module {
             case BUSY -> { }
             case BROKEN -> onBreakSucceeded(pos);
             case BLOCKED -> {
-                // A block that will not break in reasonable time gets parked so the loop cannot
-                // spin on it; anything else is transient and just needs a rescan.
                 final String reason = breaker.blockedReason();
                 if (reason.contains("no progress")) {
                     skipTarget(pos, reason);
@@ -445,41 +452,26 @@ public class AutoAmethystModule extends Module {
 
     private void tickSettle() {
         if (--settleTicks > 0) return;
-        state = State.SCAN;
+        state = State.IDLE;
     }
 
     private void tickCollecting() {
         final DropCollector.Status status = collector.tick(
-            this::isOurYield, PLUGIN_CONFIG.collection, anchorX, anchorY, anchorZ,
-            harvest().inputPriority);
+            this::isOurYield, PLUGIN_CONFIG.collection, anchorX, anchorY, anchorZ);
         switch (status) {
-            case CHASING, RETURNING, IDLE -> { }
+            case CHASING -> { }
             case DONE -> {
                 yieldNow = countYield();
-                state = State.RETURNING;
-            }
-            case FAILED -> {
-                warn("Drop collection gave up: {}", collector.failReason());
-                state = State.RETURNING;
-            }
-        }
-    }
-
-    private void tickReturning() {
-        final DropCollector.Status status = collector.tickReturn(
-            PLUGIN_CONFIG.collection, anchorX, anchorY, anchorZ, harvest().inputPriority);
-        switch (status) {
-            case RETURNING, CHASING, IDLE -> { }
-            case DONE -> {
-                scanTimer.skip();
-                state = State.SCAN;
-            }
-            case FAILED -> {
-                // not fatal: we are still somewhere sane, just re-anchor and carry on
-                warn("Could not walk back to the stand position: {}", collector.failReason());
+                // Wherever the collector ended up is the new stand position. There is no route to
+                // rejoin, so there is nothing to walk back for.
                 setAnchorHere();
                 scanTimer.skip();
-                state = State.SCAN;
+                state = State.IDLE;
+            }
+            case FAILED -> {
+                debug("Drop collection gave up: {}", collector.failReason());
+                setAnchorHere();
+                state = State.IDLE;
             }
         }
     }
@@ -493,20 +485,14 @@ public class AutoAmethystModule extends Module {
             case DONE -> {
                 deposits++;
                 final int after = countYield();
-                // Carried yield drops when a deposit succeeds, so bank the difference or the
-                // session total would read as a loss every time the shulker is filled.
                 if (yieldBeforeDeposit > after) depositedTotal += yieldBeforeDeposit - after;
                 yieldNow = after;
                 yieldAtStart = after;
                 shulkersStored = depositCycle.shulkersStored();
-                // The run walks itself back to the stand position, so re-anchor on where we
-                // actually ended up rather than assuming it succeeded.
                 setAnchorHere();
                 collector.clearUnreachable();
                 scanTimer.skip();
-                state = State.SCAN;
-                // If the run freed nothing, running it again immediately would just loop. The usual
-                // cause is an inventory full of filled shulkers with nowhere to put them.
+                state = State.IDLE;
                 if (freeInventorySlots() <= Math.max(0, PLUGIN_CONFIG.deposit.triggerFreeSlots)) {
                     pause(PLUGIN_CONFIG.deposit.chestSet
                         ? "deposit finished but the inventory is still full - check the storage chest"
@@ -518,36 +504,33 @@ public class AutoAmethystModule extends Module {
         }
     }
 
-    private void tickMoving() {
-        final MovementDriver.Status status = mover.tick(
-            movementMode(), PLUGIN_CONFIG.movement, harvest().inputPriority);
+    /** Walking back to the parking spot, if one is configured. Never fatal. */
+    private void tickGoingHome() {
+        final Travel.Status status = travel.tick(
+            PLUGIN_CONFIG.movement, Math.max(2.0, PLUGIN_CONFIG.movement.homeTolerance));
         switch (status) {
             case BUSY -> { }
-            case ARRIVED -> {
-                dwellTicks = 0;
-                failedWaypoints = 0;
-                setAnchorHere();
-                // drops that were unreachable from the last stand position may well be reachable
-                // from this one
-                collector.clearUnreachable();
-                scanTimer.skip();
-                state = State.SCAN;
-            }
-            case FAILED -> {
-                // One unroutable waypoint must not stop the farm. Chunks unload, mobs stand in
-                // doorways, and a stand position recorded on a ladder may not be standable at all -
-                // none of which says anything about the other waypoints. Try the next one, and only
-                // give up once a full cycle has failed.
-                warn("Waypoint {} unreachable: {}", waypointIndex + 1, mover.failReason());
-                if (++failedWaypoints >= Math.max(1, PLUGIN_CONFIG.movement.waypoints.size())) {
-                    pause("no waypoint could be reached (last: " + mover.failReason() + ")");
-                    return;
+            case ARRIVED, FAILED -> {
+                // Either way we stop trying. Failing to reach an arbitrary parking spot is no
+                // reason to stop farming; the bot just works from wherever it is.
+                if (status == Travel.Status.FAILED) {
+                    debug("Could not get home: {}", travel.failReason());
                 }
                 setAnchorHere();
-                dwellTicks = Integer.MAX_VALUE / 2; // move on immediately rather than dwelling
-                state = State.SCAN;
+                state = State.IDLE;
             }
         }
+    }
+
+    /** Sets off for the home spot if one is set and we are not already near it. */
+    private void goHomeIfIdle() {
+        final AutoAmethystConfig.Movement cfg = PLUGIN_CONFIG.movement;
+        if (!cfg.returnHome || !cfg.homeSet) return;
+        final double dist = MathHelper.distance3d(
+            cfg.homeX + 0.5, cfg.homeY + 0.5, cfg.homeZ + 0.5, BOT.getX(), BOT.getY(), BOT.getZ());
+        if (dist <= Math.max(2.0, cfg.homeTolerance)) return;
+        travel.begin(cfg.homeX, cfg.homeY, cfg.homeZ);
+        state = State.GOING_HOME;
     }
 
     // ------------------------------------------------------------------ deposit trigger
@@ -570,82 +553,50 @@ public class AutoAmethystModule extends Module {
     // ------------------------------------------------------------------ scanning
 
     /**
-     * Rebuilds {@link #reachable}.
+     * Sweeps the entire box and rebuilds {@link #matureTargets}, nearest first.
      *
-     * <p>Only the part of the box that could possibly be in reach is swept. Reach is at most the
-     * vanilla 4.5, so this is a ~10 block cube regardless of how big the geode is - sweeping the
-     * whole box every second would be a few hundred thousand block lookups on the tick thread for
-     * no benefit. The whole-box census that feeds the "mature in box" stat runs on its own much
-     * slower timer.
+     * <p>The whole box, every time. A geode is a couple of chunks across - the box is capped at
+     * 64^3 and a real one is a fraction of that - so this is a few tens of thousands of array reads
+     * on a timer, which is nothing. Scanning everything is what lets the bot walk straight to a ripe
+     * cluster instead of following a route and hoping something grew where the route happens to go.
      */
-    private void rescan() {
-        reachable.clear();
+    private void fullScan() {
+        matureTargets.clear();
         expireSkips();
         checkForReverts();
         yieldNow = countYield();
 
         final AutoAmethystConfig.Harvest h = harvest();
-        final double reach = effectiveReach();
-        final int r = (int) Math.ceil(reach) + 1;
-        final int px = MathHelper.floorI(BOT.getX());
-        final int py = MathHelper.floorI(BOT.getEyeY());
-        final int pz = MathHelper.floorI(BOT.getZ());
-
-        final int loX = Math.max(h.minX, px - r), hiX = Math.min(h.maxX, px + r);
-        final int loY = Math.max(h.minY, py - r), hiY = Math.min(h.maxY, py + r);
-        final int loZ = Math.max(h.minZ, pz - r), hiZ = Math.min(h.maxZ, pz + r);
-
-        diagFoundInCube = 0;
-        diagRejectedFar = 0;
-        diagRejectedSkipped = 0;
-        for (int x = loX; x <= hiX; x++) {
-            for (int z = loZ; z <= hiZ; z++) {
-                if (!World.isChunkLoadedBlockPos(x, z)) continue;
-                for (int y = loY; y <= hiY; y++) {
-                    if (!isHarvestable(World.getBlock(x, y, z))) continue;
-                    diagFoundInCube++;
-                    final long pos = BlockPos.asLong(x, y, z);
-                    if (isSkipped(pos)) { diagRejectedSkipped++; continue; }
-                    if (!withinReach(x, y, z, reach)) { diagRejectedFar++; continue; }
-                    reachable.add(pos);
-                }
-            }
-        }
-
-        if (censusTimer.tick(Math.max(20, harvest().censusIntervalTicks))) {
-            recountBox();
-        }
-    }
-
-    /** Whole-box count of mature clusters. Statistics only; never used to pick a target. */
-    private void recountBox() {
-        final AutoAmethystConfig.Harvest h = harvest();
-        int count = 0;
         int skippedColumns = 0;
+        int count = 0;
         double nearestSq = Double.MAX_VALUE;
         int nx = 0, ny = 0, nz = 0;
         final double ex = BOT.getX(), ey = BOT.getEyeY(), ez = BOT.getZ();
+
         for (int x = h.minX; x <= h.maxX; x++) {
             for (int z = h.minZ; z <= h.maxZ; z++) {
                 if (!World.isChunkLoadedBlockPos(x, z)) { skippedColumns++; continue; }
                 for (int y = h.minY; y <= h.maxY; y++) {
                     if (!isHarvestable(World.getBlock(x, y, z))) continue;
                     count++;
-                    // Tracked so "nothing in reach" can say how far away the nearest one actually
-                    // is, which is the difference between "wrong waypoints" and "empty geode".
                     final double d = MathHelper.distanceSq3d(x + 0.5, y + 0.5, z + 0.5, ex, ey, ez);
                     if (d < nearestSq) {
                         nearestSq = d;
                         nx = x; ny = y; nz = z;
                     }
+                    final long pos = BlockPos.asLong(x, y, z);
+                    if (isSkipped(pos)) { diagRejectedSkipped++; continue; }
+                    matureTargets.add(pos);
                 }
             }
         }
+
         matureInBox = count;
-        // A count taken over unloaded chunks is not evidence of anything. Nothing may act on it -
-        // in particular the "wait until N are ripe" gate must not park the bot forever because the
-        // box happened to be unloaded when it looked.
-        censusReliable = skippedColumns == 0;
+        // A count taken over unloaded chunks is not evidence of anything, so nothing may act on it -
+        // in particular the "wait for N to ripen" gate must not park the bot because the box
+        // happened to be unloaded when it looked.
+        scanReliable = skippedColumns == 0;
+        diagFoundInCube = count;
         if (count > 0) {
             diagNearestDist = Math.sqrt(nearestSq);
             diagNearestDx = nx - h.minX;
@@ -654,95 +605,56 @@ public class AutoAmethystModule extends Module {
         } else {
             diagNearestDist = -1;
         }
+        sortTargetsByDistance();
     }
 
-    /**
-     * A human readable answer to "why is the bot standing there doing nothing".
-     *
-     * <p>Deliberately reports box-relative offsets rather than world coordinates, so the output is
-     * safe to paste anywhere.
-     */
-    public List<String> diagnose() {
-        final List<String> out = new java.util.ArrayList<>();
-        out.add("state=" + stateName() + " mode=" + mode() + " movement=" + movementMode());
-        if (paused) out.add("PAUSED: " + pauseReason);
-        out.add("mature in box=" + matureInBox + (censusReliable ? "" : " (UNRELIABLE - box chunks unloaded)")
-            + "  found in scan cube=" + diagFoundInCube
-            + "  in reach=" + reachable.size());
-        if (idleWaiting) {
-            out.add("=> parked on purpose: waiting for " + PLUGIN_CONFIG.movement.minMatureToPatrol
-                + " clusters to ripen before walking a lap (only " + matureInBox + " ready)."
-                + " Change with 'autoamethyst patrolat <n>'.");
-        }
-        out.add("rejected: too far=" + diagRejectedFar
-            + "  on cooldown=" + diagRejectedSkipped
-            + "  no line of sight=" + diagRejectedNoLos);
-        if (diagNearestDist >= 0) {
-            out.add(String.format("nearest harvestable is %.2f blocks away at box+[%d, %d, %d] (reach is %.2f)",
-                diagNearestDist, diagNearestDx, diagNearestDy, diagNearestDz, effectiveReach()));
-            if (diagNearestDist > effectiveReach() && reachable.isEmpty()) {
-                out.add("=> nothing is within reach of this stand position; the bot should be moving."
-                    + " Check the waypoints actually put it next to the clusters.");
-            }
-        } else {
-            out.add("no harvestable blocks anywhere in the box (is the box right? is the chunk loaded?)");
-        }
-        if (diagRejectedNoLos > 0 && reachable.isEmpty()) {
-            out.add("=> everything in reach was rejected for line of sight."
-                + " If the clusters are plainly visible, try 'autoamethyst los off'.");
-        }
-        out.add("movement: " + mover.describe()
-            + "  waypoint=" + (waypointIndex + 1) + "/" + PLUGIN_CONFIG.movement.waypoints.size()
-            + "  dwell=" + dwellTicks + "/" + PLUGIN_CONFIG.movement.dwellTicks
-            + "  ticks since leg start=" + (tickCounter - lastWaypointStartTick));
-        out.add("collection=" + (PLUGIN_CONFIG.collection.enabled ? "on" : "off")
-            + "  deposit=" + (PLUGIN_CONFIG.deposit.enabled ? "on" : "off")
-            + "  free slots=" + freeInventorySlots()
-            + "  pathfinder clamped=" + pathfinderClamped());
-        final ItemStack held = CACHE.getPlayerCache().getEquipment(EquipmentSlot.MAIN_HAND);
-        out.add("held tool ok=" + HarvestPolicy.isCorrectPickaxe(held, mode())
-            + "  fortune=" + HarvestPolicy.enchantLevel(held, EnchantmentRegistry.FORTUNE.get())
-            + "  silk=" + HarvestPolicy.hasEnchant(held, EnchantmentRegistry.SILK_TOUCH.get()));
-        return out;
+    /** Nearest first, so the bot always walks the shortest hop to the next cluster. */
+    private void sortTargetsByDistance() {
+        if (matureTargets.size() < 2) return;
+        final double ex = BOT.getX(), ey = BOT.getEyeY(), ez = BOT.getZ();
+        final long[] arr = matureTargets.toLongArray();
+        final Long[] boxed = new Long[arr.length];
+        for (int i = 0; i < arr.length; i++) boxed[i] = arr[i];
+        java.util.Arrays.sort(boxed, (a, b) -> Double.compare(distSq(a, ex, ey, ez), distSq(b, ex, ey, ez)));
+        matureTargets.clear();
+        for (final Long v : boxed) matureTargets.add(v.longValue());
     }
 
-    /**
-     * Cheap distance pre-filter so the expensive raycasts only run on the one target we pick.
-     * Uses the interaction box centre, which for a cluster is nowhere near the block centre.
-     */
-    private boolean withinReach(final int x, final int y, final int z, final double reach) {
-        final Position c = World.blockInteractionCenter(x, y, z);
-        final double d = MathHelper.distanceSq3d(c.x(), c.y(), c.z(), BOT.getX(), BOT.getEyeY(), BOT.getZ());
-        return d <= reach * reach;
+    private static double distSq(final long pos, final double ex, final double ey, final double ez) {
+        return MathHelper.distanceSq3d(
+            BlockPos.getX(pos) + 0.5, BlockPos.getY(pos) + 0.5, BlockPos.getZ(pos) + 0.5, ex, ey, ez);
     }
 
-    /** Returns the nearest reachable target that still passes every guard, or {@link Long#MIN_VALUE}. */
-    private long pickNearestTarget() {
-        long best = Long.MIN_VALUE;
-        double bestDist = Double.MAX_VALUE;
-        final double reach = effectiveReach();
-        diagRejectedNoLos = 0;
-        final LongIterator it = reachable.iterator();
+    /** The next target still worth going to, nearest first, or {@link Long#MIN_VALUE}. */
+    private long nextTarget() {
+        final LongIterator it = matureTargets.iterator();
         while (it.hasNext()) {
             final long pos = it.nextLong();
-            final int x = BlockPos.getX(pos);
-            final int y = BlockPos.getY(pos);
-            final int z = BlockPos.getZ(pos);
-            if (!isHarvestable(World.getBlock(x, y, z))) continue;
+            final int x = BlockPos.getX(pos), y = BlockPos.getY(pos), z = BlockPos.getZ(pos);
             if (isSkipped(pos)) continue;
-            final Position c = World.blockInteractionCenter(x, y, z);
-            final Vector2f rot = RotationHelper.rotationTo(c.x(), c.y(), c.z());
-            if (!BreakDriver.canEngage(x, y, z, rot, reach, harvest().requireLineOfSight)) {
-                diagRejectedNoLos++;
-                continue;
-            }
-            final double d = MathHelper.distanceSq3d(c.x(), c.y(), c.z(), BOT.getX(), BOT.getEyeY(), BOT.getZ());
-            if (d < bestDist) {
-                bestDist = d;
-                best = pos;
-            }
+            if (!World.isChunkLoadedBlockPos(x, z)) continue;
+            if (!isHarvestable(World.getBlock(x, y, z))) continue;
+            return pos;
         }
-        return best;
+        return Long.MIN_VALUE;
+    }
+
+    /** Whether this block can be broken from exactly where the bot stands right now. */
+    private boolean inReachWithSight(final int x, final int y, final int z) {
+        if (!World.isChunkLoadedBlockPos(x, z)) return false;
+        final double reach = effectiveReach();
+        final Position c = World.blockInteractionCenter(x, y, z);
+        if (MathHelper.distanceSq3d(c.x(), c.y(), c.z(), BOT.getX(), BOT.getEyeY(), BOT.getZ())
+            > reach * reach) {
+            diagRejectedFar++;
+            return false;
+        }
+        final Vector2f rot = RotationHelper.rotationTo(c.x(), c.y(), c.z());
+        if (!BreakDriver.canEngage(x, y, z, rot, reach, harvest().requireLineOfSight)) {
+            diagRejectedNoLos++;
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -763,7 +675,7 @@ public class AutoAmethystModule extends Module {
         breaks++;
         consecutiveFailures = 0;
         recentlyBroken.put(pos, tickCounter);
-        reachable.rem(pos);
+        matureTargets.rem(pos);
         settleTicks = Math.max(1, harvest().interBreakDelayTicks);
         state = State.SETTLE;
         logHarvest(pos);
@@ -778,18 +690,18 @@ public class AutoAmethystModule extends Module {
             return;
         }
         scanTimer.skip();
-        state = State.SCAN;
+        state = State.IDLE;
     }
 
     /** Target is bad; blacklist it for a while so the loop cannot spin on it. */
     private void skipTarget(final long pos, final String reason) {
         skipped++;
         skipUntil.put(pos, tickCounter + Math.max(20, harvest().skipCooldownTicks));
-        reachable.rem(pos);
+        matureTargets.rem(pos);
         warn("Skipping {}: {}", describe(pos), reason);
         releaseBreak();
         scanTimer.skip();
-        state = State.SCAN;
+        state = State.IDLE;
     }
 
     private void releaseBreak() {
@@ -840,55 +752,14 @@ public class AutoAmethystModule extends Module {
         return until != null && tickCounter < until;
     }
 
-    // ------------------------------------------------------------------ movement
+    // ------------------------------------------------------------------ anchor
 
+    /** The stand position the collector is leashed to, so the bot cannot drift over hours. */
     private void setAnchorHere() {
         anchorX = CACHE.getPlayerCache().getX();
         anchorY = CACHE.getPlayerCache().getY();
         anchorZ = CACHE.getPlayerCache().getZ();
         anchorSet = true;
-    }
-
-    private void beginNextWaypoint() {
-        // Snapshot: the command thread can add to or clear this list between our size check and our
-        // indexed read, and a config edit must not be able to throw out of the tick loop.
-        final List<String> waypoints = List.copyOf(PLUGIN_CONFIG.movement.waypoints);
-        if (waypoints.isEmpty()) return;
-        if (visitedAnyWaypoint) {
-            waypointIndex = (waypointIndex + 1) % waypoints.size();
-        } else {
-            waypointIndex = 0;
-            visitedAnyWaypoint = true;
-        }
-        if (waypointIndex >= waypoints.size()) waypointIndex = 0;
-        // Deliberately does not echo the waypoint text: these are real world coordinates and this
-        // message goes to the log, the in-game alert and potentially Discord.
-        final int[] wp = parseWaypoint(waypoints.get(waypointIndex));
-        if (wp == null) {
-            pause("waypoint #" + (waypointIndex + 1) + " is malformed (expected \"x y z\")");
-            return;
-        }
-        dwellTicks = 0;
-        lastWaypointStartTick = tickCounter;
-        debug("Moving to waypoint {}/{}", waypointIndex + 1, waypoints.size());
-        mover.begin(movementMode(), wp[0], wp[1], wp[2]);
-        state = State.MOVING;
-    }
-
-    /** Parses "x y z" into a triple, or null if it is not three integers. */
-    public static int @Nullable [] parseWaypoint(final String raw) {
-        if (raw == null) return null;
-        final String[] parts = raw.trim().split("\\s+");
-        if (parts.length != 3) return null;
-        try {
-            return new int[]{
-                Integer.parseInt(parts[0]),
-                Integer.parseInt(parts[1]),
-                Integer.parseInt(parts[2])
-            };
-        } catch (final NumberFormatException e) {
-            return null;
-        }
     }
 
     // ------------------------------------------------------------------ tool handling
@@ -1050,6 +921,51 @@ public class AutoAmethystModule extends Module {
         return (int) ((remaining * 100L) / max);
     }
 
+    // ------------------------------------------------------------------ diagnosis
+
+    /**
+     * A human readable answer to "why is the bot standing there doing nothing".
+     *
+     * <p>Reports box-relative offsets rather than world coordinates, so the output is safe to paste
+     * anywhere.
+     */
+    public List<String> diagnose() {
+        final List<String> out = new java.util.ArrayList<>();
+        out.add("state=" + stateName() + "  mode=" + mode());
+        if (paused) out.add("PAUSED: " + pauseReason);
+        out.add("ripe in box=" + matureInBox + (scanReliable ? "" : " (UNRELIABLE - box chunks unloaded)")
+            + "  targets queued=" + matureTargets.size()
+            + "  waiting for " + Math.max(1, harvest().minMatureToHarvest));
+        out.add("rejected since last scan: too far=" + diagRejectedFar
+            + "  on cooldown=" + diagRejectedSkipped
+            + "  no line of sight=" + diagRejectedNoLos);
+        if (diagNearestDist >= 0) {
+            out.add(String.format("nearest ripe cluster is %.2f blocks away at box+[%d, %d, %d] (reach %.2f)",
+                diagNearestDist, diagNearestDx, diagNearestDy, diagNearestDz, effectiveReach()));
+        } else {
+            out.add("no ripe clusters anywhere in the box"
+                + (scanReliable ? "" : " - but the scan could not read it, so that means nothing"));
+        }
+        if (idleWaiting) {
+            out.add("=> parked on purpose: " + matureInBox + " ripe, waiting for "
+                + Math.max(1, harvest().minMatureToHarvest)
+                + ". Change with 'autoamethyst ripeat <n>'.");
+        }
+        if (travel.isActive()) {
+            out.add("travelling: " + travel.ticks() + " ticks so far");
+        }
+        out.add("collection=" + (PLUGIN_CONFIG.collection.enabled ? "on" : "off")
+            + "  deposit=" + (PLUGIN_CONFIG.deposit.enabled ? "on" : "off")
+            + "  home=" + (PLUGIN_CONFIG.movement.homeSet ? "set" : "not set")
+            + "  free slots=" + freeInventorySlots()
+            + "  pathfinder clamped=" + pathfinderClamped());
+        final ItemStack held = CACHE.getPlayerCache().getEquipment(EquipmentSlot.MAIN_HAND);
+        out.add("held tool ok=" + HarvestPolicy.isCorrectPickaxe(held, mode())
+            + "  fortune=" + HarvestPolicy.enchantLevel(held, EnchantmentRegistry.FORTUNE.get())
+            + "  silk=" + HarvestPolicy.hasEnchant(held, EnchantmentRegistry.SILK_TOUCH.get()));
+        return out;
+    }
+
     // ------------------------------------------------------------------ instrumentation
 
     /**
@@ -1141,7 +1057,7 @@ public class AutoAmethystModule extends Module {
         paused = true;
         pauseReason = reason;
         releaseBreak();
-        mover.reset();
+        travel.stop();
         collector.reset();
         depositCycle.reset();
         warn("Paused: {}", reason);
@@ -1153,7 +1069,7 @@ public class AutoAmethystModule extends Module {
         paused = false;
         pauseReason = "";
         consecutiveFailures = 0;
-        state = State.SCAN;
+        state = State.IDLE;
         anchorSet = false;
         scanTimer.skip();
     }
@@ -1172,6 +1088,6 @@ public class AutoAmethystModule extends Module {
     public long deposits() { return deposits; }
     public int shulkersStored() { return shulkersStored; }
     public int matureInBox() { return matureInBox; }
-    public int reachableCount() { return reachable.size(); }
+    public int reachableCount() { return matureTargets.size(); }
     public boolean pathfinderClamped() { return pathGuard.isApplied() && pathGuard.stillClamped(); }
 }

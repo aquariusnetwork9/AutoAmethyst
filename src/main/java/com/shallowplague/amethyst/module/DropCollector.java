@@ -2,10 +2,7 @@ package com.shallowplague.amethyst.module;
 
 import com.shallowplague.amethyst.AutoAmethystConfig;
 import com.zenith.cache.data.entity.Entity;
-import com.zenith.feature.player.Input;
-import com.zenith.feature.player.InputRequest;
 import com.zenith.feature.pathfinder.goals.GoalNear;
-import com.zenith.feature.player.RotationHelper;
 import com.zenith.mc.block.BlockPos;
 import com.zenith.util.math.MathHelper;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.metadata.MetadataTypes;
@@ -18,471 +15,181 @@ import java.util.Set;
 import java.util.function.Predicate;
 
 import static com.zenith.Globals.BARITONE;
+import static com.zenith.Globals.BOT;
 import static com.zenith.Globals.CACHE;
-import static com.zenith.Globals.INPUTS;
 
 /**
  * Walks the bot onto dropped items so nothing is left on the ground.
  *
- * <p>Passive pickup is not enough. A broken block's drop can fly a couple of blocks from where it
- * was broken, which is well outside the ~1 block vanilla pickup radius, so a bot that never moves
- * would steadily leak shards onto the floor to despawn five minutes later.
+ * <p>Passive pickup is not enough on its own: a drop can fly a couple of blocks from where the
+ * block broke, well outside the ~1 block vanilla pickup radius.
  *
- * <p>Two ways to move. A short hand walk on ordinary vanilla inputs for anything nearby, and the
- * pathfinder for drops it cannot simply walk onto - another level of the rig, the far side of a
- * wall, anywhere needing a ladder. Handing those to the pathfinder is only safe because {@link
- * PathfinderGuard} has clamped its ability to break and place: it can route to a shard but can
- * never mine its way there, which inside a geode is the difference between a collector and a
- * demolition crew.
+ * <p><b>The pathfinder does the walking.</b> Every chase is a {@code GoalNear} on the item's block
+ * and Baritone routes to it - around obstacles, up a ladder, down a level. An earlier version
+ * hand-walked toward drops and only escalated to the pathfinder when that failed, which is how the
+ * bot ended up stuck against half blocks and corners it could obviously have walked around.
  *
- * <p>Everything stays inside a leash from the stand position, and the bot walks back afterwards, so
- * it cannot drift off station over hours of running. Drops it fails to reach are remembered so the
- * next scan does not immediately pick the same one and livelock on it.
+ * <p>Safe inside the rig only because {@link PathfinderGuard} has clamped {@code allowBreak} and
+ * {@code allowPlace} off: it can route to a shard but can never mine its way there.
+ *
+ * <p>Drops it genuinely cannot reach are remembered, so the next scan does not pick the same one
+ * and livelock on it. That matters because some shards do land where nothing can walk - a gap
+ * behind the rig, a ledge with no standable block beside it.
  */
 public final class DropCollector {
 
-    public enum Status { IDLE, CHASING, RETURNING, DONE, FAILED }
+    public enum Status { CHASING, DONE, FAILED }
 
-    private final Object owner;
-
-    /**
-     * Ticks between path requests. Path calculation is async, so re-issuing every tick stalls it -
-     * and dropped items drift, so a short cooldown had the bot recalculating a path every second
-     * and filling the log with it. A shard is not going anywhere; it can wait two seconds.
-     */
-    private static final int REPATH_COOLDOWN_TICKS = 40;
+    private static final int REPATH_COOLDOWN_TICKS = 30;
+    /** Vanilla item pickup reaches about a block; inside that the server hands it over unprompted. */
+    private static final double PICKUP_RADIUS = 1.2;
 
     private @Nullable Integer targetEntityId;
     private int chaseTicks;
-    private int stuckTicks;
-    private double lastX, lastY, lastZ;
+    private int repathCooldown;
+    private int idleTicks;
+    private int pathTargetX, pathTargetY, pathTargetZ;
+    private boolean pathIssued;
     private String failReason = "";
 
-    /** True while the pathfinder is driving the chase, so we know to stop it and to stay off inputs. */
-    private boolean pathing;
-    private int repathCooldown;
-    private int pathTargetX, pathTargetY, pathTargetZ;
-    /** Consecutive ticks with a path requested but not running - the "no route" signature. */
-    private int pathIdleTicks;
-    /** Consecutive ticks where the distance to the target has not shrunk. */
-    private int noProgressTicks;
-    private double lastDistToTarget = -1;
-    /** Latches once this target has been handed to the pathfinder, to stop the decision flapping. */
-    private boolean escalated;
-    /** Latches when the pathfinder refused this target, so the hand walk gets it instead. */
-    private boolean pathRefused;
-    /** Ticks spent walking home, so the return leg can never spin forever. */
-    private int returnTicks;
-
-    /**
-     * The leash actually in force. Pathed chases get a longer one, because shards fall to whatever
-     * level is below the bot and a radius tight enough to keep a hand walk sane cannot reach them.
-     */
-    public static double effectiveLeash(final AutoAmethystConfig.Collection cfg) {
-        return cfg.usePathfinder ? Math.max(cfg.maxDistance, cfg.pathMaxDistance) : cfg.maxDistance;
-    }
-
-    /**
-     * Drops we could not get to. Without this, a shard that lands somewhere unwalkable - inside the
-     * rig, on a ledge, behind a block - is re-found by the very next scan and chased again, so the
-     * bot livelocks chasing and failing on the same item instead of harvesting.
-     */
+    /** Item entity ids we could not reach. Bounded so a long AFK run cannot grow it forever. */
     private final Set<Integer> unreachable = new HashSet<>();
 
-    public DropCollector(final Object owner) {
-        this.owner = owner;
-    }
+    public DropCollector() { }
 
-    public String failReason() {
-        return failReason;
-    }
+    /** Owner is unused now that the pathfinder does the walking; kept so call sites read the same. */
+    public DropCollector(final Object owner) { }
+
+    public String failReason() { return failReason; }
 
     public void reset() {
-        stopPathing();
+        if (pathIssued && BARITONE.isActive()) BARITONE.stop();
+        pathIssued = false;
         targetEntityId = null;
         chaseTicks = 0;
-        stuckTicks = 0;
-        noProgressTicks = 0;
-        lastDistToTarget = -1;
-        escalated = false;
-        pathRefused = false;
-        returnTicks = 0;
+        repathCooldown = 0;
+        idleTicks = 0;
         failReason = "";
     }
 
-    /** Clears the unreachable list, e.g. after the bot moves to a new stand position. */
     public void clearUnreachable() {
         unreachable.clear();
     }
 
-    /**
-     * Writes this drop off and stops chasing it. Reported as FAILED so the caller can log it, but
-     * the entity is remembered so the next scan does not immediately pick it again.
-     */
-    private Status abandonCurrent(final String reason) {
-        stopPathing();
-        failReason = reason;
-        if (targetEntityId != null) {
-            unreachable.add(targetEntityId);
-            // Bound it. Item entity ids are never reused within a session, but a long AFK run
-            // should not accumulate an unbounded set.
-            if (unreachable.size() > 256) unreachable.clear();
-        }
-        targetEntityId = null;
-        chaseTicks = 0;
-        stuckTicks = 0;
-        noProgressTicks = 0;
-        lastDistToTarget = -1;
-        escalated = false;
-        pathRefused = false;
-        return Status.FAILED;
-    }
-
-    /**
-     * True when there is a matching drop worth walking to: outside the pickup radius but inside the
-     * allowed wander distance of the anchor.
-     */
+    /** True when a matching drop is worth walking to: outside pickup range, inside the leash. */
     public boolean hasWorkNear(final Predicate<ItemStack> wanted, final double anchorX,
-                               final double anchorY, final double anchorZ, final double maxDistance) {
-        return findNearestDrop(wanted, anchorX, anchorY, anchorZ, maxDistance) != null;
+                               final double anchorY, final double anchorZ, final double leash) {
+        return findNearest(wanted, anchorX, anchorY, anchorZ, leash) != null;
     }
 
-    /**
-     * Drives one tick of collection. Returns DONE when there is nothing left to chase within range.
-     */
+    /** Drives one tick. DONE when nothing reachable is left within the leash. */
     public Status tick(final Predicate<ItemStack> wanted, final AutoAmethystConfig.Collection cfg,
-                       final double anchorX, final double anchorY, final double anchorZ,
-                       final int priority) {
-        // effectiveLeash, not maxDistance: finding targets with the narrow hand-walk radius would
-        // mean a drop on the level below is never even considered, which defeats the whole point of
-        // having a wider leash for pathed chases.
-        final Entity target = resolveTarget(wanted, anchorX, anchorY, anchorZ, effectiveLeash(cfg));
+                       final double anchorX, final double anchorY, final double anchorZ) {
+        final Entity target = resolve(wanted, anchorX, anchorY, anchorZ, cfg.maxDistance);
         if (target == null) {
-            // Stop any path we started, or it keeps running underneath the next state and fights
-            // whatever asks the pathfinder for something else.
-            stopPathing();
-            targetEntityId = null;
+            reset();
             return Status.DONE;
         }
 
-        // A pathed chase gets far longer than a hand walk: climbing down a ladder, crossing a level
-        // and coming back is easily ten seconds, and the hand-walk timeout was cutting good trips
-        // off part way.
-        final int timeout = pathing
-            ? Math.max(40, cfg.pathChaseTimeoutTicks)
-            : Math.max(20, cfg.chaseTimeoutTicks);
-        if (++chaseTicks > timeout) {
-            stopPathing();
-            return abandonCurrent("gave up chasing a drop after " + chaseTicks + " ticks");
+        if (++chaseTicks > Math.max(60, cfg.chaseTimeoutTicks)) {
+            return abandon("gave up after " + chaseTicks + " ticks");
         }
 
-        // Refuse to step outside the leash even if the item drifts. Better to leave one shard than
-        // to wander out of the rig.
-        final double distFromAnchor = MathHelper.distance3d(
-            target.getX(), target.getY(), target.getZ(), anchorX, anchorY, anchorZ);
-        if (distFromAnchor > effectiveLeash(cfg)) {
-            stopPathing();
-            targetEntityId = null;
-            chaseTicks = 0;
-            return Status.CHASING;
-        }
-
-        final double dy = target.getY() - CACHE.getPlayerCache().getY();
-        final boolean progressing = trackProgress(Math.max(20, cfg.stuckTicks));
-
-        // Escalate on failure to CONVERGE, not merely on failure to move.
-        //
-        // trackProgress only notices a bot that has stopped dead. A bot walking into a wall at an
-        // angle, sliding along it, or circling a shard it cannot step onto is moving the whole time
-        // - so the stuck check never fired, the chase never escalated to the pathfinder, and it ran
-        // out the full hand-walk timeout every time. Distance to the target is the honest measure.
-        final double distToTarget = MathHelper.distance3d(
-            target.getX(), target.getY(), target.getZ(),
-            CACHE.getPlayerCache().getX(), CACHE.getPlayerCache().getY(), CACHE.getPlayerCache().getZ());
-        if (lastDistToTarget >= 0 && distToTarget >= lastDistToTarget - 0.02) {
-            noProgressTicks++;
-        } else {
-            noProgressTicks = 0;
-        }
-        lastDistToTarget = distToTarget;
-
-        // A jump clears about 1.25 blocks. Anything higher than that cannot be reached by walking
-        // at it, no matter how many times we try - the bot just bounces off the wall below it until
-        // the chase times out, even with a ladder a few blocks away. Hand those to the pathfinder,
-        // which knows how to climb. Same for a drop well below us, and for a hand walk that has
-        // stopped making progress.
-        // Once a target has been escalated it STAYS escalated until the target changes. Without
-        // that latch the decision flips as the item settles or drifts across the height threshold,
-        // and since giving up on a path resets the repath cooldown, the flapping fired a fresh path
-        // request every other tick - which is the "Calculated path to goal" storm in the log.
-        if (cfg.usePathfinder
-            && !pathRefused
-            && (escalated
-                || Math.abs(dy) > cfg.pathfinderHeightThreshold
-                || stuckTicks >= Math.max(1, cfg.escalateToPathTicks)
-                || noProgressTicks >= Math.max(1, cfg.escalateToPathTicks))) {
-            escalated = true;
-            return pathToward(target, cfg);
-        }
-        // Only judge a HAND walk on progress. While the pathfinder has the leg the bot is legitimately
-        // motionless during async path calculation, and chaseTimeoutTicks already bounds that.
-        if (!progressing) {
-            stopPathing();
-            return abandonCurrent("stopped moving while chasing a drop");
-        }
-        if (pathing) stopPathing();
-
-        // Jump for drops just above: on top of a block, on a ledge, or up a full block step (the
-        // 0.6 auto-step handles slabs and stairs but not a whole block).
-        final boolean jump = cfg.jumpForDrops
-            && (dy > cfg.jumpHeightThreshold || stuckTicks >= Math.max(1, cfg.jumpAfterStuckTicks));
-        walkToward(target.getX(), target.getZ(), cfg.sneakWhileCollecting,
-                   cfg.sprintWhileCollecting, jump, priority);
-        return Status.CHASING;
-    }
-
-    /**
-     * Lets the pathfinder walk the bot to a drop it cannot reach on foot.
-     *
-     * <p>Critically, this submits <b>no inputs of its own</b> while a path is running. The module's
-     * input priority sits above the pathfinder's, so continuing to press forward here would fight
-     * the path it just asked for and the bot would go nowhere.
-     *
-     * <p>Paths are re-issued on a cooldown rather than every tick: path calculation is asynchronous,
-     * so during the window before {@code isActive()} turns true a per-tick re-issue produces a storm
-     * of instantly-satisfied requests and no actual movement.
-     */
-    private Status pathToward(final Entity target, final AutoAmethystConfig.Collection cfg) {
         final int bx = MathHelper.floorI(target.getX());
         final int by = MathHelper.floorI(target.getY());
         final int bz = MathHelper.floorI(target.getZ());
 
-        // Some shards land where nothing can walk - a gap behind the rig, a ledge with no standable
-        // block beside it. The pathfinder answers "No path found" after searching a couple of
-        // million nodes, and the only visible symptom is the bot standing still. Detect it by the
-        // path simply never starting, and write the drop off in a second rather than burning the
-        // whole chase timeout on it.
-        if (pathing) {
-            if (BARITONE.isActive()) {
-                pathIdleTicks = 0;
-            } else if (++pathIdleTicks > Math.max(10, cfg.pathGiveUpTicks)) {
-                // The pathfinder would not route here. Do NOT give up - hand the chase back to the
-                // plain walk, which can reach plenty of places the planner refuses.
-                //
-                // The big one is budding amethyst. Zenith's MovementHelper#isBlockNormalCube
-                // excludes every block whose name contains "amethyst" except plain amethyst_block,
-                // so the planner treats a budding block as unwalkable even though it is an ordinary
-                // full cube you can stand on in vanilla - and shards land on top of them constantly.
-                // That rule lives in core and a plugin cannot change it, but the hand walk never
-                // consults it.
-                stopPathing();
-                pathRefused = true;
-                // Fresh budget for the hand walk. The pathed attempt has already spent part of the
-                // chase, and handing the fallback a nearly-expired clock would fail it immediately.
-                chaseTicks = 0;
-                noProgressTicks = 0;
-                lastDistToTarget = -1;
-                return Status.CHASING;
-            }
-        }
-
         if (repathCooldown > 0) {
             repathCooldown--;
-        } else if (!BARITONE.isActive() || bx != pathTargetX || by != pathTargetY || bz != pathTargetZ) {
-            // rangeSq 2 is close enough for the ~1 block pickup radius to finish the job
-            BARITONE.pathTo(new GoalNear(new BlockPos(bx, by, bz), 2));
-            pathTargetX = bx;
-            pathTargetY = by;
-            pathTargetZ = bz;
-            pathing = true;
-            repathCooldown = REPATH_COOLDOWN_TICKS;
+            return Status.CHASING;
         }
+        if (BARITONE.isActive()) {
+            idleTicks = 0;
+            // Follow the item if it has drifted to a different block since we asked.
+            if (bx != pathTargetX || by != pathTargetY || bz != pathTargetZ) {
+                issuePath(bx, by, bz);
+            }
+            return Status.CHASING;
+        }
+
+        // Not moving and not planning. Either we have not asked yet, or the pathfinder came back
+        // with no route. A couple of retries, then write it off rather than standing here.
+        if (pathIssued && ++idleTicks > 3) {
+            return abandon("no route to it");
+        }
+        issuePath(bx, by, bz);
         return Status.CHASING;
     }
 
-    private void stopPathing() {
-        if (!pathing) return;
-        pathing = false;
-        repathCooldown = 0;
-        pathIdleTicks = 0;
-        if (BARITONE.isActive()) BARITONE.stop();
+    private void issuePath(final int x, final int y, final int z) {
+        BARITONE.pathTo(new GoalNear(new BlockPos(x, y, z), 1));
+        pathTargetX = x;
+        pathTargetY = y;
+        pathTargetZ = z;
+        pathIssued = true;
+        repathCooldown = REPATH_COOLDOWN_TICKS;
     }
 
-    /**
-     * Walks back to the stand position. Returns DONE once close enough.
-     *
-     * <p>Uses the pathfinder for the same reason the chase does: if the bot climbed a ladder to
-     * reach a shard, it cannot hand-walk back down to where it started, and a walk that keeps
-     * failing would leave it stranded a level above the geode.
-     */
-    public Status tickReturn(final AutoAmethystConfig.Collection cfg, final double anchorX,
-                             final double anchorY, final double anchorZ, final int priority) {
-        final double dy = anchorY - CACHE.getPlayerCache().getY();
-
-        // The arrival tolerance must never be tighter than the precision of the goal used to get
-        // here. The return paths with GoalNear(anchor, rangeSq 2), which parks the bot up to ~1.41
-        // blocks away - so a 0.6 tolerance can never be satisfied by a pathed return. The goal is
-        // already met, every path completes instantly, and the leg repaths forever: the bot stands
-        // still in RETURNING with "Pathing complete" scrolling past every couple of seconds.
-        //
-        // Precision is not the point here anyway. This leg exists so the bot does not drift off
-        // station over hours; landing a block or two out is entirely fine.
-        final double tolerance = (pathing || pathRefused)
-            ? Math.max(cfg.returnTolerance, 2.0)
-            : cfg.returnTolerance;
-        if (horizontalDistance(anchorX, anchorZ) <= tolerance
-            && Math.abs(dy) <= cfg.pathfinderHeightThreshold) {
-            reset();
-            return Status.DONE;
-        }
-
-        // Never let the walk home run forever. The caller treats a failed return as "re-anchor
-        // where you are and carry on", which is a perfectly good outcome and far better than a bot
-        // that stops harvesting because it cannot get back to an arbitrary spot.
-        if (++returnTicks > Math.max(100, cfg.returnTimeoutTicks)) {
-            failReason = "could not get back to the stand position in "
-                + returnTicks + " ticks; re-anchoring here";
-            reset();
-            return Status.FAILED;
-        }
-        final boolean progressing = trackProgress(Math.max(20, cfg.stuckTicks));
-        final boolean needsPath = cfg.usePathfinder
-            && (Math.abs(dy) > cfg.pathfinderHeightThreshold
-                || stuckTicks >= Math.max(1, cfg.escalateToPathTicks));
-        if (needsPath) {
-            final int bx = MathHelper.floorI(anchorX);
-            final int by = MathHelper.floorI(anchorY);
-            final int bz = MathHelper.floorI(anchorZ);
-            if (repathCooldown > 0) {
-                repathCooldown--;
-            } else if (!BARITONE.isActive() || bx != pathTargetX || by != pathTargetY || bz != pathTargetZ) {
-                BARITONE.pathTo(new GoalNear(new BlockPos(bx, by, bz), 2));
-                pathTargetX = bx;
-                pathTargetY = by;
-                pathTargetZ = bz;
-                pathing = true;
-                repathCooldown = REPATH_COOLDOWN_TICKS;
-            }
-            return Status.RETURNING;
-        }
-        if (!progressing) {
-            failReason = "stopped moving while returning to the stand position";
-            reset();
-            return Status.FAILED;
-        }
-        if (pathing) stopPathing();
-        // hasWorkNear also consults the unreachable set, so a returning bot cannot be re-triggered
-        // by the same item it just gave up on
-        walkToward(anchorX, anchorZ, cfg.sneakWhileCollecting, cfg.sprintWhileCollecting,
-                   stuckTicks >= Math.max(1, cfg.jumpAfterStuckTicks), priority);
-        return Status.RETURNING;
-    }
-
-    /** Re-resolves the tracked entity each tick; items are pushed around and can be picked up. */
-    private @Nullable Entity resolveTarget(final Predicate<ItemStack> wanted, final double anchorX,
-                                           final double anchorY, final double anchorZ,
-                                           final double maxDistance) {
+    /** Re-resolves each tick: items get pushed around, picked up, and despawn. */
+    private @Nullable Entity resolve(final Predicate<ItemStack> wanted, final double anchorX,
+                                     final double anchorY, final double anchorZ, final double leash) {
         if (targetEntityId != null) {
             final Entity existing = CACHE.getEntityCache().get(targetEntityId);
             if (existing != null && existing.getEntityType() == EntityType.ITEM
                 && matches(existing, wanted)) {
                 return existing;
             }
-            // it despawned, was collected, or changed identity: pick a new one
             targetEntityId = null;
             chaseTicks = 0;
+            pathIssued = false;
         }
-        final Entity next = findNearestDrop(wanted, anchorX, anchorY, anchorZ, maxDistance);
+        final Entity next = findNearest(wanted, anchorX, anchorY, anchorZ, leash);
         if (next != null) {
             targetEntityId = next.getEntityId();
             chaseTicks = 0;
-            // A new target must start with a clean convergence history, or it inherits the previous
-            // target's distance and looks like it is already failing to make progress.
-            noProgressTicks = 0;
-            lastDistToTarget = -1;
-            escalated = false;
-            pathRefused = false;
-            snapshotPosition();
+            idleTicks = 0;
+            pathIssued = false;
+            repathCooldown = 0;
         }
         return next;
     }
 
-    private @Nullable Entity findNearestDrop(final Predicate<ItemStack> wanted, final double anchorX,
-                                             final double anchorY, final double anchorZ,
-                                             final double maxDistance) {
+    private @Nullable Entity findNearest(final Predicate<ItemStack> wanted, final double anchorX,
+                                         final double anchorY, final double anchorZ, final double leash) {
         Entity best = null;
         double bestDist = Double.MAX_VALUE;
-        final double maxSq = maxDistance * maxDistance;
+        final double leashSq = leash * leash;
+        final double pickupSq = PICKUP_RADIUS * PICKUP_RADIUS;
         for (final Entity entity : CACHE.getEntityCache().getEntities().values()) {
             if (entity.getEntityType() != EntityType.ITEM) continue;
             if (unreachable.contains(entity.getEntityId())) continue;
             if (!matches(entity, wanted)) continue;
-            final double anchorDistSq = MathHelper.distanceSq3d(
+            final double fromAnchor = MathHelper.distanceSq3d(
                 entity.getX(), entity.getY(), entity.getZ(), anchorX, anchorY, anchorZ);
-            if (anchorDistSq > maxSq) continue;
-            final double selfDistSq = MathHelper.distanceSq3d(
-                entity.getX(), entity.getY(), entity.getZ(),
-                CACHE.getPlayerCache().getX(), CACHE.getPlayerCache().getY(), CACHE.getPlayerCache().getZ());
-            // already close enough that the server will hand it over without us moving
-            if (selfDistSq <= PICKUP_RADIUS_SQ) continue;
-            if (selfDistSq < bestDist) {
-                bestDist = selfDistSq;
+            if (fromAnchor > leashSq) continue;
+            final double fromSelf = MathHelper.distanceSq3d(
+                entity.getX(), entity.getY(), entity.getZ(), BOT.getX(), BOT.getY(), BOT.getZ());
+            if (fromSelf <= pickupSq) continue; // already close enough to be collected for free
+            if (fromSelf < bestDist) {
+                bestDist = fromSelf;
                 best = entity;
             }
         }
         return best;
     }
 
-    /** Vanilla item pickup reaches about one block; treat anything inside that as already ours. */
-    private static final double PICKUP_RADIUS_SQ = 1.2 * 1.2;
-
     private static boolean matches(final Entity entity, final Predicate<ItemStack> wanted) {
         final ItemStack stack = entity.getMetadataValue(8, MetadataTypes.ITEM, ItemStack.class);
         return stack != null && wanted.test(stack);
     }
 
-    private void walkToward(final double x, final double z, final boolean sneak,
-                            final boolean sprint, final boolean jump, final int priority) {
-        final float yaw = RotationHelper.yawToXZ(x, z);
-        INPUTS.submit(InputRequest.builder()
-            .owner(owner)
-            .input(Input.builder()
-                .pressingForward(true)
-                .sneaking(sneak)
-                // Zenith cancels sprint whenever sneak is held, so these can never conflict.
-                .sprinting(sprint && !sneak)
-                .jumping(jump)
-                .build())
-            .yaw(yaw)
-            .priority(priority)
-            .build());
-    }
-
-    private double horizontalDistance(final double x, final double z) {
-        final double dx = x - CACHE.getPlayerCache().getX();
-        final double dz = z - CACHE.getPlayerCache().getZ();
-        return Math.sqrt(dx * dx + dz * dz);
-    }
-
-    private boolean trackProgress(final int limit) {
-        final double x = CACHE.getPlayerCache().getX();
-        final double y = CACHE.getPlayerCache().getY();
-        final double z = CACHE.getPlayerCache().getZ();
-        if (MathHelper.distanceSq3d(x, y, z, lastX, lastY, lastZ) < 0.0025) {
-            stuckTicks++;
-        } else {
-            stuckTicks = 0;
+    private Status abandon(final String reason) {
+        if (targetEntityId != null) {
+            unreachable.add(targetEntityId);
+            if (unreachable.size() > 256) unreachable.clear();
         }
-        lastX = x;
-        lastY = y;
-        lastZ = z;
-        return stuckTicks < limit;
-    }
-
-    private void snapshotPosition() {
-        lastX = CACHE.getPlayerCache().getX();
-        lastY = CACHE.getPlayerCache().getY();
-        lastZ = CACHE.getPlayerCache().getZ();
-        stuckTicks = 0;
+        reset();
+        failReason = reason; // after reset, which clears it
+        return Status.FAILED;
     }
 }

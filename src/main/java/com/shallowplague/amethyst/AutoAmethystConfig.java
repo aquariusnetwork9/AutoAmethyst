@@ -67,10 +67,23 @@ public class AutoAmethystConfig {
         public int maxZ = 0;
 
         /**
-         * How often to rebuild the candidate target list. Only the part of the box within reach is
-         * swept, so this is cheap regardless of how large the geode is.
+         * How often to sweep the whole box for ripe clusters.
+         *
+         * <p>The whole box every time, not just what is within reach. A geode is a couple of chunks
+         * across, so this is a few tens of thousands of array reads on a timer - nothing - and it
+         * means the bot always knows where every ripe cluster is instead of having to wander past
+         * them to notice.
          */
-        public int rescanIntervalTicks = 20;
+        public int scanIntervalTicks = 100;
+
+        /**
+         * Wait until this many clusters are ripe before setting off to harvest.
+         *
+         * <p>Growth is the bottleneck, not travel - a face yields a cluster roughly every 2h17m - so
+         * walking across the geode the instant one appears just means more walking for the same
+         * shards. Set to 1 to go as soon as anything is ready.
+         */
+        public int minMatureToHarvest = 2;
 
         /**
          * How often to sweep the whole box to count mature clusters. Statistics only, and the whole
@@ -153,80 +166,48 @@ public class AutoAmethystConfig {
         public int noToolGraceTicks = 200;
     }
 
+    /**
+     * Where the bot parks between harvests, and how it travels.
+     *
+     * <p>There is deliberately no route, patrol or waypoint list. A geode is a couple of chunks
+     * across, so the bot scans the whole thing from wherever it stands and walks straight to
+     * whatever has ripened. Routes were a mistake: they made the bot wander past clusters it could
+     * not see from the route, and stall on stand positions that were never quite right.
+     */
     public final Movement movement = new Movement();
 
     public static final class Movement {
         /**
-         * STATIONARY - never move. Harvest whatever is in reach of the parked position.
-         * WAYPOINT   - path between waypoints with Zenith's pathfinder. Requires the rig's vertical
-         *              runs to be ladders or vines; the path planner cannot route scaffolding.
-         * SCAFFOLD   - hand driven walk/climb along a single scaffolding column. Uses only vanilla
-         *              movement inputs (forward / jump / sneak) so Zenith's physics simulation
-         *              produces ordinary position packets.
-         */
-        public String mode = "STATIONARY";
-
-        /** Stand positions, "x y z", visited in order and cycled. Set with {@code waypoint add}. */
-        public List<String> waypoints = new ArrayList<>();
-
-        /** Minimum ticks to spend at a waypoint before moving on, even if nothing is mature. */
-        public int dwellTicks = 40;
-
-        /**
-         * Stay parked until at least this many clusters are ripe anywhere in the box, instead of
-         * patrolling continuously.
+         * Where the bot parks when there is nothing to do. Set with {@code autoamethyst home}.
          *
-         * <p>Growth is the bottleneck, not travel: a face yields a cluster roughly every 2h17m, so
-         * a lap of the rig every few seconds finds nothing new almost every time. Waiting until
-         * there is a worthwhile amount to pick up costs no throughput at all and buys a bot that is
-         * standing still most of the time - less pathfinder churn, less movement for anticheat to
-         * look at, and a log that is readable.
-         *
-         * <p>Set to 0 or 1 to patrol continuously as before.
+         * <p>Optional. With no home set the bot simply stays wherever its last harvest left it,
+         * which is fine - the point of a home is a spot you have chosen for random-tick coverage.
          */
-        public int minMatureToPatrol = 2;
+        public boolean homeSet = false;
+        public int homeX = 0;
+        public int homeY = 0;
+        public int homeZ = 0;
 
-        /** Horizontal distance in blocks at which a waypoint counts as reached. */
-        public double arriveRadius = 0.45;
+        /** Walk back to the home spot once there is nothing left to harvest, collect or deposit. */
+        public boolean returnHome = true;
 
-        /** Give up on a movement leg after this many ticks and pause. */
+        /** How close to home counts as home. Never tighter than the pathfinder's own goal precision. */
+        public double homeTolerance = 3.0;
+
+        /** Give up on any single travel leg after this long. */
         public int legTimeoutTicks = 600;
 
-        /** Ticks of no measurable position change before a leg is considered stuck. */
-        public int stuckTicks = 60;
-
-        // --- SCAFFOLD mode only ---
-
         /**
-         * XZ of the single scaffolding column used for all vertical travel. Vertical legs walk to
-         * this column first, climb, then walk out to the target. Set with {@code column here}.
+         * Refuse to walk further than this for one cluster. A geode is a couple of chunks across,
+         * so anything beyond this is either a bad box or a cluster in a neighbouring formation.
          */
-        public boolean columnSet = false;
-        public int columnX = 0;
-        public int columnZ = 0;
-
-        /** Vertical tolerance in blocks for a climb leg to count as finished. */
-        public double climbTolerance = 0.2;
+        public double maxTravelDistance = 96.0;
 
         /**
-         * Sneak while walking. Off by default - it is roughly a third of walking speed, and the
-         * ledge protection it buys only matters on a rig with open drops. Turn it back on if the
-         * bot keeps walking off something.
-         */
-        public boolean sneakWhileWalking = false;
-
-        /**
-         * Run. Applies both to the hand driven walk and to Zenith's pathfinder, whose own
-         * {@code allowSprint} defaults to <b>false</b> - which is why a waypoint leg crawls even
-         * when nothing is sneaking.
+         * Run. Zenith's pathfinder has {@code allowSprint} FALSE by default, which is why travel
+         * crawls unless this turns it on.
          */
         public boolean sprint = true;
-
-        /** Jump when blocked, to get up a full block step the 0.6 auto-step cannot manage. */
-        public boolean jumpWhenStuck = true;
-
-        /** Ticks of no progress before trying a jump. */
-        public int jumpAfterStuckTicks = 10;
     }
 
     public final Collection collection = new Collection();

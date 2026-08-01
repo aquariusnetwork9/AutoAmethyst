@@ -3,7 +3,6 @@ package com.shallowplague.amethyst.command;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.shallowplague.amethyst.module.AutoAmethystModule;
 import com.shallowplague.amethyst.module.HarvestPolicy;
-import com.shallowplague.amethyst.module.MovementDriver;
 import com.zenith.feature.player.World;
 import org.jspecify.annotations.Nullable;
 import com.zenith.Proxy;
@@ -46,24 +45,20 @@ public class AutoAmethystCommand extends Command {
                 ever broken.
 
                 Movement modes:
-                  stationary - never moves, harvests whatever is in reach
-                  waypoint   - paths between waypoints (needs ladders, not scaffolding)
-                  scaffold   - walks and climbs a single scaffolding column by hand
                 """)
             .usageLines(
                 "on/off",
                 "status",
                 "resume",
                 "box corner1|corner2|show",
+                "home | home clear",
+                "ripeat <clusters>",
+                "scanevery <ticks>",
                 "harvest shards|silk",
                 "buds protect|allow",
                 "stage cluster|large|medium|small on/off",
-                "mode stationary|waypoint|scaffold",
-                "waypoint add|clear|list",
-                "column here",
                 "collect on/off",
                 "deposit here|chest here|supply here|haul on/off|on/off|status",
-                "patrolat <clusters>",
                 "why",
                 "debug on/off",
                 "sprint on/off",
@@ -109,6 +104,47 @@ public class AutoAmethystCommand extends Command {
                 module().resume();
                 c.getSource().getEmbed().title("Resumed").primaryColor();
             }))
+            .then(literal("home")
+                .then(literal("clear").executes(c -> {
+                    PLUGIN_CONFIG.movement.homeSet = false;
+                    c.getSource().getEmbed()
+                        .title("Home cleared")
+                        .description("The bot will now stay wherever its last harvest left it.")
+                        .primaryColor();
+                }))
+                .executes(c -> {
+                    if (!connected()) {
+                        c.getSource().getEmbed().title("Not connected").errorColor();
+                        return ERROR;
+                    }
+                    PLUGIN_CONFIG.movement.homeX = MathHelper.floorI(CACHE.getPlayerCache().getX());
+                    PLUGIN_CONFIG.movement.homeY = MathHelper.floorI(CACHE.getPlayerCache().getY());
+                    PLUGIN_CONFIG.movement.homeZ = MathHelper.floorI(CACHE.getPlayerCache().getZ());
+                    PLUGIN_CONFIG.movement.homeSet = true;
+                    c.getSource().getEmbed()
+                        .title("Home set")
+                        .description("The bot parks here when there is nothing to harvest, collect "
+                            + "or deposit. Pick a spot with good random-tick coverage of the geode.")
+                        .primaryColor();
+                    return OK;
+                }))
+            .then(literal("ripeat").then(argument("clusters", integer(1)).executes(c -> {
+                PLUGIN_CONFIG.harvest.minMatureToHarvest = getInteger(c, "clusters");
+                c.getSource().getEmbed()
+                    .title("Harvest threshold set")
+                    .description("The bot waits until " + PLUGIN_CONFIG.harvest.minMatureToHarvest
+                        + " cluster(s) are ripe, then walks straight to them. Growth is the "
+                        + "bottleneck, so waiting costs no throughput.")
+                    .primaryColor();
+            })))
+            .then(literal("scanevery").then(argument("ticks", integer(20)).executes(c -> {
+                PLUGIN_CONFIG.harvest.scanIntervalTicks = getInteger(c, "ticks");
+                c.getSource().getEmbed()
+                    .title("Scan interval set")
+                    .description("The whole box is swept every "
+                        + PLUGIN_CONFIG.harvest.scanIntervalTicks + " ticks.")
+                    .primaryColor();
+            })))
             .then(literal("box")
                 .then(literal("corner1").executes(c -> { return setCorner(c, true); }))
                 .then(literal("corner2").executes(c -> { return setCorner(c, false); }))
@@ -305,60 +341,7 @@ public class AutoAmethystCommand extends Command {
                     c.getSource().getEmbed()
                         .title("Deposit " + toggleStrCaps(PLUGIN_CONFIG.deposit.enabled));
                 })))
-            .then(literal("mode").then(argument("mode", word()).executes(c -> {
-                final String raw = getString(c, "mode");
-                final MovementDriver.Mode parsed = MovementDriver.parseMode(raw);
-                if (!parsed.name().equalsIgnoreCase(raw.trim())) {
-                    c.getSource().getEmbed()
-                        .title("Unknown mode")
-                        .description("Expected stationary, waypoint or scaffold")
-                        .errorColor();
-                    return ERROR;
-                }
-                PLUGIN_CONFIG.movement.mode = parsed.name();
-                module().requestReload();
-                c.getSource().getEmbed().title("Movement mode: " + parsed).primaryColor();
-                return OK;
-            })))
-            .then(literal("waypoint")
-                .then(literal("add").executes(c -> {
-                    if (!connected()) {
-                        c.getSource().getEmbed().title("Not connected").errorColor();
-                        return ERROR;
-                    }
-                    PLUGIN_CONFIG.movement.waypoints.add(currentBlockPosString());
-                    module().requestReload();
-                    c.getSource().getEmbed()
-                        .title("Waypoint added")
-                        .addField("Total", PLUGIN_CONFIG.movement.waypoints.size())
-                        .primaryColor();
-                    return OK;
-                }))
-                .then(literal("clear").executes(c -> {
-                    PLUGIN_CONFIG.movement.waypoints.clear();
-                    module().requestReload();
-                    c.getSource().getEmbed().title("Waypoints cleared").primaryColor();
-                }))
-                .then(literal("list").executes(c -> {
-                    c.getSource().getEmbed()
-                        .title("Waypoints")
-                        .addField("Count", PLUGIN_CONFIG.movement.waypoints.size())
-                        .description("Positions are intentionally not printed. They are in plugins/config/auto-amethyst.json")
-                        .primaryColor();
-                })))
-            .then(literal("column").then(literal("here").executes(c -> {
-                if (!connected()) {
-                    c.getSource().getEmbed().title("Not connected").errorColor();
-                    return ERROR;
-                }
-                PLUGIN_CONFIG.movement.columnX = MathHelper.floorI(CACHE.getPlayerCache().getX());
-                PLUGIN_CONFIG.movement.columnZ = MathHelper.floorI(CACHE.getPlayerCache().getZ());
-                PLUGIN_CONFIG.movement.columnSet = true;
-                module().requestReload();
-                c.getSource().getEmbed().title("Scaffolding column set to current position").primaryColor();
-                return OK;
-            })))
-            .then(literal("reach").then(argument("blocks", integer(0, 6)).executes(c -> {
+                                                .then(literal("reach").then(argument("blocks", integer(0, 6)).executes(c -> {
                 PLUGIN_CONFIG.harvest.maxReach = getInteger(c, "blocks");
                 c.getSource().getEmbed()
                     .title("Reach cap set")
@@ -374,17 +357,7 @@ public class AutoAmethystCommand extends Command {
                 c.getSource().getEmbed()
                     .title("Line of sight requirement " + toggleStrCaps(PLUGIN_CONFIG.harvest.requireLineOfSight));
             })))
-            .then(literal("patrolat").then(argument("clusters", integer(0)).executes(c -> {
-                PLUGIN_CONFIG.movement.minMatureToPatrol = getInteger(c, "clusters");
-                c.getSource().getEmbed()
-                    .title("Patrol threshold set")
-                    .description(PLUGIN_CONFIG.movement.minMatureToPatrol > 1
-                        ? "The bot stays parked until " + PLUGIN_CONFIG.movement.minMatureToPatrol
-                          + " clusters are ripe, then walks a lap."
-                        : "The bot patrols continuously.")
-                    .primaryColor();
-            })))
-            .then(literal("why").executes(c -> {
+                        .then(literal("why").executes(c -> {
                 c.getSource().getMultiLineOutput().addAll(module().diagnose());
             }))
             .then(literal("debug").then(argument("toggle", toggle()).executes(c -> {
@@ -402,14 +375,7 @@ public class AutoAmethystCommand extends Command {
                     .title("Sprint " + toggleStrCaps(PLUGIN_CONFIG.movement.sprint))
                     .description("Applies to the hand driven walk and to the pathfinder.");
             })))
-            .then(literal("sneak").then(argument("toggle", toggle()).executes(c -> {
-                PLUGIN_CONFIG.movement.sneakWhileWalking = getToggle(c, "toggle");
-                PLUGIN_CONFIG.collection.sneakWhileCollecting = PLUGIN_CONFIG.movement.sneakWhileWalking;
-                c.getSource().getEmbed()
-                    .title("Sneak " + toggleStrCaps(PLUGIN_CONFIG.movement.sneakWhileWalking))
-                    .description("Sneaking is slow but keeps vanilla ledge protection on.");
-            })))
-            .then(literal("tool").then(argument("toggle", toggle()).executes(c -> {
+                        .then(literal("tool").then(argument("toggle", toggle()).executes(c -> {
                 PLUGIN_CONFIG.tool.enabled = getToggle(c, "toggle");
                 c.getSource().getEmbed().title("Tool management " + toggleStrCaps(PLUGIN_CONFIG.tool.enabled));
             })))
@@ -550,8 +516,7 @@ public class AutoAmethystCommand extends Command {
             .addField("Box", PLUGIN_CONFIG.harvest.boxSet ? "set" : "not set")
             .addField("Harvest mode", PLUGIN_CONFIG.harvest.mode)
             .addField("Bud protection", toggleStr(PLUGIN_CONFIG.harvest.protectBuds))
-            .addField("Movement", PLUGIN_CONFIG.movement.mode)
-            .addField("Waypoints", PLUGIN_CONFIG.movement.waypoints.size())
+            .addField("Home", PLUGIN_CONFIG.movement.homeSet ? "set" : "not set")
             .addField("Collect drops", toggleStr(PLUGIN_CONFIG.collection.enabled))
             .addField("Deposit", toggleStr(PLUGIN_CONFIG.deposit.enabled))
             .addField("Tool mgmt", toggleStr(PLUGIN_CONFIG.tool.enabled))
