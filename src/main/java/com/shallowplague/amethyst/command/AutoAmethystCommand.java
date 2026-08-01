@@ -2,7 +2,9 @@ package com.shallowplague.amethyst.command;
 
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.shallowplague.amethyst.module.AutoAmethystModule;
+import com.shallowplague.amethyst.module.HarvestPolicy;
 import com.shallowplague.amethyst.module.MovementDriver;
+import com.zenith.feature.player.World;
 import com.zenith.Proxy;
 import com.zenith.command.api.Command;
 import com.zenith.command.api.CommandCategory;
@@ -52,9 +54,14 @@ public class AutoAmethystCommand extends Command {
                 "status",
                 "resume",
                 "box corner1|corner2|show",
+                "harvest shards|silk",
+                "buds protect|allow",
+                "stage cluster|large|medium|small on/off",
                 "mode stationary|waypoint|scaffold",
                 "waypoint add|clear|list",
                 "column here",
+                "collect on/off",
+                "deposit here|on/off|status",
                 "reach <blocks>",
                 "delay <ticks>",
                 "los on/off",
@@ -79,13 +86,15 @@ public class AutoAmethystCommand extends Command {
                     .title("AutoAmethyst Status")
                     .addField("State", m.stateName())
                     .addField("Breaks", m.breaks())
-                    .addField("Shards", m.shardsGained())
-                    .addField("Shards/hr", String.format("%.1f", m.shardsPerHour()))
+                    .addField("Yield", m.yieldGained())
+                    .addField("Yield/hr", String.format("%.1f", m.yieldPerHour()))
                     .addField("Mature in box", m.matureInBox())
                     .addField("In reach", m.reachableCount())
                     .addField("Skipped", m.skippedCount())
                     .addField("Reverted", m.reverts())
                     .addField("Tool swaps", m.toolSwaps())
+                    .addField("Deposits", m.deposits())
+                    .addField("Pathfinder clamped", m.pathfinderClamped() ? "yes" : "NO")
                     .primaryColor();
                 if (m.isPaused()) {
                     c.getSource().getEmbed().description("Paused: " + m.pauseReason()).errorColor();
@@ -110,6 +119,121 @@ public class AutoAmethystCommand extends Command {
                         .description("Coordinates are intentionally not printed. They are in plugins/config/auto-amethyst.json")
                         .primaryColor();
                     return OK;
+                })))
+            .then(literal("harvest").then(argument("mode", word()).executes(c -> {
+                final String raw = getString(c, "mode");
+                final HarvestPolicy.Mode parsed = HarvestPolicy.parseMode(raw);
+                if (!parsed.name().equalsIgnoreCase(raw.trim())) {
+                    c.getSource().getEmbed()
+                        .title("Unknown harvest mode")
+                        .description("Expected shards or silk")
+                        .errorColor();
+                    return ERROR;
+                }
+                PLUGIN_CONFIG.harvest.mode = parsed.name();
+                module().requestReload();
+                c.getSource().getEmbed()
+                    .title("Harvest mode: " + parsed)
+                    .description(parsed == HarvestPolicy.Mode.SILK
+                        ? "Requires a Silk Touch pickaxe. Buds still need 'buds allow' before they can be broken."
+                        : "Requires a non-Silk pickaxe. Fortune III averages 8.8 shards per cluster.")
+                    .primaryColor();
+                return OK;
+            })))
+            .then(literal("buds")
+                .then(literal("protect").executes(c -> {
+                    PLUGIN_CONFIG.harvest.protectBuds = true;
+                    module().requestReload();
+                    c.getSource().getEmbed()
+                        .title("Bud protection ON")
+                        .description("Immature buds can no longer be broken under any configuration.")
+                        .primaryColor();
+                }))
+                .then(literal("allow").executes(c -> {
+                    PLUGIN_CONFIG.harvest.protectBuds = false;
+                    module().requestReload();
+                    c.getSource().getEmbed()
+                        .title("Bud protection OFF")
+                        .description("Buds can now be broken in SILK mode if the stage is enabled. "
+                            + "Each bud broken throws away up to ~2h17m of growth on that face.")
+                        .errorColor();
+                })))
+            .then(literal("stage")
+                .then(literal("cluster").then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.harvest.silkHarvestCluster = getToggle(c, "toggle");
+                    module().requestReload();
+                    c.getSource().getEmbed().title("Silk cluster harvest "
+                        + toggleStrCaps(PLUGIN_CONFIG.harvest.silkHarvestCluster));
+                })))
+                .then(literal("large").then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.harvest.silkHarvestLargeBud = getToggle(c, "toggle");
+                    module().requestReload();
+                    c.getSource().getEmbed().title("Silk large bud harvest "
+                        + toggleStrCaps(PLUGIN_CONFIG.harvest.silkHarvestLargeBud));
+                })))
+                .then(literal("medium").then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.harvest.silkHarvestMediumBud = getToggle(c, "toggle");
+                    module().requestReload();
+                    c.getSource().getEmbed().title("Silk medium bud harvest "
+                        + toggleStrCaps(PLUGIN_CONFIG.harvest.silkHarvestMediumBud));
+                })))
+                .then(literal("small").then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.harvest.silkHarvestSmallBud = getToggle(c, "toggle");
+                    module().requestReload();
+                    c.getSource().getEmbed().title("Silk small bud harvest "
+                        + toggleStrCaps(PLUGIN_CONFIG.harvest.silkHarvestSmallBud));
+                }))))
+            .then(literal("collect").then(argument("toggle", toggle()).executes(c -> {
+                PLUGIN_CONFIG.collection.enabled = getToggle(c, "toggle");
+                c.getSource().getEmbed()
+                    .title("Drop collection " + toggleStrCaps(PLUGIN_CONFIG.collection.enabled));
+            })))
+            .then(literal("deposit")
+                .then(literal("here").executes(c -> {
+                    if (!connected()) {
+                        c.getSource().getEmbed().title("Not connected").errorColor();
+                        return ERROR;
+                    }
+                    final int x = MathHelper.floorI(CACHE.getPlayerCache().getX());
+                    final int y = MathHelper.floorI(CACHE.getPlayerCache().getY());
+                    final int z = MathHelper.floorI(CACHE.getPlayerCache().getZ());
+                    if (!HarvestPolicy.isSafeToPlaceAt(x, y, z)
+                        && !HarvestPolicy.isShulkerBlock(World.getBlock(x, y, z))) {
+                        c.getSource().getEmbed()
+                            .title("Unsafe deposit position")
+                            .description("That spot is either not clear, or it sits on a growth face of a "
+                                + "budding amethyst. Placing there would permanently stop that face growing. "
+                                + "Stand somewhere clear of the geode and try again.")
+                            .errorColor();
+                        return ERROR;
+                    }
+                    PLUGIN_CONFIG.deposit.x = x;
+                    PLUGIN_CONFIG.deposit.y = y;
+                    PLUGIN_CONFIG.deposit.z = z;
+                    PLUGIN_CONFIG.deposit.posSet = true;
+                    module().requestReload();
+                    c.getSource().getEmbed()
+                        .title("Deposit position set")
+                        .description("Put an empty shulker box there, or leave it clear and the bot will "
+                            + "place one from its inventory.")
+                        .primaryColor();
+                    return OK;
+                }))
+                .then(literal("status").executes(c -> {
+                    c.getSource().getEmbed()
+                        .title("Deposit")
+                        .addField("Enabled", toggleStr(PLUGIN_CONFIG.deposit.enabled))
+                        .addField("Position", PLUGIN_CONFIG.deposit.posSet ? "set" : "not set")
+                        .addField("Trigger", "<= " + PLUGIN_CONFIG.deposit.triggerFreeSlots + " free slots")
+                        .addField("Replace when full", toggleStr(PLUGIN_CONFIG.deposit.replaceWhenFull))
+                        .description("Position is intentionally not printed.")
+                        .primaryColor();
+                }))
+                .then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.deposit.enabled = getToggle(c, "toggle");
+                    module().requestReload();
+                    c.getSource().getEmbed()
+                        .title("Deposit " + toggleStrCaps(PLUGIN_CONFIG.deposit.enabled));
                 })))
             .then(literal("mode").then(argument("mode", word()).executes(c -> {
                 final String raw = getString(c, "mode");
@@ -254,12 +378,15 @@ public class AutoAmethystCommand extends Command {
             .addField("AutoAmethyst", toggleStr(PLUGIN_CONFIG.harvest.enabled))
             .addField("State", m.stateName())
             .addField("Box", PLUGIN_CONFIG.harvest.boxSet ? "set" : "not set")
+            .addField("Harvest mode", PLUGIN_CONFIG.harvest.mode)
+            .addField("Bud protection", toggleStr(PLUGIN_CONFIG.harvest.protectBuds))
             .addField("Movement", PLUGIN_CONFIG.movement.mode)
             .addField("Waypoints", PLUGIN_CONFIG.movement.waypoints.size())
-            .addField("Line of sight", toggleStr(PLUGIN_CONFIG.harvest.requireLineOfSight))
+            .addField("Collect drops", toggleStr(PLUGIN_CONFIG.collection.enabled))
+            .addField("Deposit", toggleStr(PLUGIN_CONFIG.deposit.enabled))
             .addField("Tool mgmt", toggleStr(PLUGIN_CONFIG.tool.enabled))
             .addField("Breaks", m.breaks())
-            .addField("Shards", m.shardsGained())
+            .addField("Yield", m.yieldGained())
             .primaryColor();
     }
 }

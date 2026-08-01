@@ -20,12 +20,19 @@ Fortune pickaxe it can find, and never touches anything else.
 
 | Guarantee | How |
 |---|---|
-| Only ever breaks mature clusters | The target block is compared by identity against `BlockRegistry.AMETHYST_CLUSTER` on **every tick**, immediately before the click is submitted — not once when the target is chosen |
-| Never breaks buds or budding amethyst | Falls out of the above. Buds drop nothing, and `budding_amethyst` is unobtainable — one stray break permanently deletes a growth site |
-| Never places a block | There is no place code path in the plugin |
-| Never uses Silk Touch | A silk pickaxe drops the cluster block and **zero shards**. Silk is disqualifying, not merely suboptimal |
+| Only breaks what is on the allowlist | Every break goes through one `BreakDriver`, which re-checks the block against `HarvestPolicy` by identity on **every tick** immediately before the click — not once when the target is chosen. The list is: the enabled harvest stages, plus shulker boxes for the deposit. Nothing else, in any mode |
+| Never breaks budding amethyst | It is not in any allowlist, in any mode, under any configuration. It drops nothing with any tool including Silk Touch and is unobtainable — one stray break permanently deletes a growth site |
+| Never breaks immature buds by default | Double-gated behind `protectBuds` (on by default) **and** silk mode **and** a per-stage toggle. Normal shard farming cannot reach it |
+| Never places a block except a shulker | Shulkers are the only placeable, and only at the configured deposit spot |
+| Never blocks a growth face | A placement is refused if the target is not clear air or if any of its six face neighbours is a budding amethyst. Buds only grow into air, so a block on a growth face silently stops it producing — re-checked at the moment of placing, not just when configured |
+| **The pathfinder can never break or place** | `allowBreak` and `allowPlace` default to **true** in ZenithProxy, meaning pathing treats mining a wall as just another movement. The module clamps both off (plus `allowBreakAnyway`, which is the explicit override) and re-verifies every tick |
 | Never mines through a wall | Zenith's block-target raycast deliberately ignores intervening blocks; the plugin adds its own first-hit line-of-sight check that a vanilla client would have to pass |
 | Never exceeds vanilla reach | Reach comes from the server's own `BLOCK_INTERACTION_RANGE` attribute (4.5). The config value can only **lower** it |
+
+The two block guards are deliberately independent because they fail differently. The allowlist
+governs blocks the plugin deliberately aims at. The pathfinder clamp governs blocks the *pathfinder*
+would decide to remove on its own initiative to clear a route — which, left at its stock defaults,
+it absolutely will.
 
 ## Anticheat posture
 
@@ -41,6 +48,57 @@ The plugin also **detects that veto**. If a block we believed we broke reappears
 seconds, that is never regrowth (a stage takes ~34 minutes) — it is the server rejecting the break
 and reverting the optimistic client-side prediction. It is logged loudly and counted separately,
 because it means the farm is producing nothing at all while looking like it works.
+
+## Harvest modes
+
+| Mode | Tool | Breaks | Yield |
+|---|---|---|---|
+| `shards` *(default)* | pickaxe **without** Silk Touch | fully grown clusters only | 4 shards base, **8.8 average with Fortune III** |
+| `silk` | pickaxe **with** Silk Touch | clusters, and optionally each bud stage | the blocks themselves |
+
+**Fortune does nothing on immature buds.** They drop *nothing at all* without Silk Touch, so there
+is no drop for Fortune to multiply — only the terminal cluster stage has a non-silk drop. That is
+why silk mode exists at all: it is the only way to get anything out of a bud.
+
+It is also why bud harvesting is off by default and gated twice. Silk-harvesting a bud trades away
+the growth already invested in that face — up to ~2h17m — for a bud block. Worth it if you want bud
+blocks; strictly worse than waiting if you want shards. To enable:
+
+```
+autoamethyst harvest silk
+autoamethyst buds allow          # turns off the master protection
+autoamethyst stage large on      # and each stage individually
+```
+
+## Collecting and depositing
+
+**Drop collection** (`collect on`, default on). Passive pickup is not enough: a broken block's drop
+can fly a couple of blocks, well outside the ~1 block vanilla pickup radius, so a stationary bot
+steadily leaks yield onto the floor to despawn after five minutes. The bot walks onto drops with
+ordinary sneaking movement — never the pathfinder, which is entitled to decide the way to reach
+something is to mine through it. It is leashed to `maxDistance` from its stand position and walks
+back afterwards so it cannot drift over a long AFK run. A drop it genuinely cannot reach is written
+off rather than chased forever.
+
+**Deposit** (`deposit here`, then `deposit on`). When free inventory slots drop to
+`triggerFreeSlots`, the bot goes to a shulker box at a fixed position, opens it, moves the harvest
+in, and closes it. When that shulker fills it breaks it (shulkers keep their contents), picks it up,
+and places a fresh empty one from inventory. Full shulkers accumulate in the bot's inventory for you
+to collect. Keep it stocked with empty shulkers.
+
+> **Transfers use `ClickItem`, not shift-click.** Stock Zenith's `ShiftClick` sends an empty
+> `changedSlots` map — its own source comments flag this as a likely anticheat problem. On a server
+> that validates click packets it is rejected, and the failure is *silent*: the transfer simply never
+> happens. So every move is a pick-up/put-down pair. Slower, but it actually works.
+
+The deposit is paced, retries a window the server closes mid-transfer (which laggy anarchy servers
+do), and pauses with a reason rather than grinding if anything is genuinely wrong — a full shulker
+with no spare, something other than a shulker in the deposit spot, or transfers that stop taking
+effect.
+
+Put the deposit spot **outside the geode**, clear of any budding amethyst. In `scaffold` movement
+mode the deposit walk uses the pathfinder, which cannot route scaffolding, so it needs a walkable
+route.
 
 ## Movement
 
@@ -77,7 +135,9 @@ Any leg that stalls fails the leg and pauses the module with a reason, rather th
 2. Walk the bot to one interior corner of the geode: `autoamethyst box corner1`
 3. Walk to the opposite corner: `autoamethyst box corner2`
 4. Put Fortune III pickaxes (**no Silk Touch**) in the inventory.
-5. `autoamethyst on`
+5. Optional but recommended — stand somewhere clear **outside** the geode, then
+   `autoamethyst deposit here` and `autoamethyst deposit on`. Carry a few empty shulker boxes.
+6. `autoamethyst on`
 
 For a multi-level rig, add stand positions by standing on each and running `autoamethyst waypoint
 add`, set the column with `autoamethyst column here`, then `autoamethyst mode scaffold`.
@@ -88,12 +148,22 @@ add`, set the column with `autoamethyst column here`, then `autoamethyst mode sc
 
 ```
 on/off                      toggle
-status                      breaks, shards, shards/hr, reverts, skips
+status                      breaks, yield, yield/hr, reverts, skips, deposits
 resume                      clear a pause
 box corner1|corner2|show    define the geode box from the bot's position
+
+harvest shards|silk         which stages to break and which pickaxe to require
+buds protect|allow          master bud protection (on by default)
+stage cluster|large|medium|small on/off    per-stage silk toggles
+
 mode stationary|waypoint|scaffold
 waypoint add|clear|list     stand positions, taken from the bot's position
 column here                 set the scaffolding column
+
+collect on/off              walk onto dropped items
+deposit here                set the shulker position from the bot's position
+deposit on/off|status       shulker deposit cycle
+
 reach <blocks>              lower the reach cap (0 = server default)
 delay <ticks>               idle time after each break
 los on/off                  line-of-sight requirement
@@ -102,6 +172,9 @@ swapat <percent>            durability threshold for swapping pickaxes
 realcoords on/off           absolute coordinates in the harvest log
 ```
 
+`status` reports **Pathfinder clamped**. If that ever reads `NO`, something re-enabled the
+pathfinder's ability to break and place; the module pauses rather than run in that state.
+
 ## Coordinates and opsec
 
 The geode box, waypoints and column are real coordinates on an anarchy server. They live in
@@ -109,6 +182,7 @@ The geode box, waypoints and column are real coordinates on an anarchy server. T
 
 - Every position is set from where the bot is standing. You never type or paste a coordinate.
 - `box show` and `waypoint list` report sizes and counts, never positions.
+- `deposit here` and `deposit status` report whether a position is set, never what it is.
 - The harvest log records positions as offsets from the box corner, not absolute coordinates.
   `realcoords on` overrides this — only turn it on if you understand where that file ends up.
 - Pause and error messages never echo a configured position, because they also go to the in-game

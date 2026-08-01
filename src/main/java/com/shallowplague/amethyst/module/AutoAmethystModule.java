@@ -7,23 +7,14 @@ import com.zenith.event.client.ClientBotTick;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.MoveToHotbarSlot;
 import com.zenith.feature.inventory.actions.SetHeldItem;
-import com.zenith.feature.player.ClickTarget;
-import com.zenith.feature.player.Input;
-import com.zenith.feature.player.InputRequest;
 import com.zenith.feature.player.Position;
 import com.zenith.feature.player.RotationHelper;
 import com.zenith.feature.player.World;
-import com.zenith.feature.player.raycast.BlockRaycastResult;
-import com.zenith.feature.player.raycast.RaycastHelper;
 import com.zenith.mc.block.Block;
 import com.zenith.mc.block.BlockPos;
-import com.zenith.mc.block.BlockRegistry;
-import com.zenith.mc.enchantment.EnchantmentData;
 import com.zenith.mc.enchantment.EnchantmentRegistry;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
-import com.zenith.mc.item.ToolTag;
-import com.zenith.mc.item.ToolType;
 import com.zenith.module.api.Module;
 import com.zenith.util.math.MathHelper;
 import com.zenith.util.timer.Timer;
@@ -32,7 +23,6 @@ import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import org.cloudburstmc.math.vector.Vector2f;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.EquipmentSlot;
-import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.MoveToHotbarAction;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes;
@@ -55,46 +45,49 @@ import static com.shallowplague.amethyst.AutoAmethystPlugin.PLUGIN_CONFIG;
 import static com.zenith.Globals.BOT;
 import static com.zenith.Globals.CACHE;
 import static com.zenith.Globals.EXECUTOR;
-import static com.zenith.Globals.INPUTS;
 import static com.zenith.Globals.INVENTORY;
 
 /**
- * Harvests mature {@code minecraft:amethyst_cluster} blocks inside a configured box.
+ * Harvests amethyst from a fixed geode rig, collects what it drops, and empties into a shulker.
  *
- * <h2>What it will and will not break</h2>
- * The target block is re-checked against {@link BlockRegistry#AMETHYST_CLUSTER} by identity on
- * <i>every single tick</i> immediately before the click input is submitted, not once when the
- * target is chosen. Nothing else can ever be swung at. That matters more than usual here: the
- * immature buds drop nothing at all, and {@code budding_amethyst} is unobtainable, so one stray
- * break permanently deletes a growth site.
+ * <h2>What can ever be broken or placed</h2>
+ * Two independent fences, because they fail in different ways:
+ * <ul>
+ *   <li>{@link HarvestPolicy} is an allowlist of specific block constants, re-checked every tick
+ *       immediately before any click. It governs blocks we deliberately aim at.</li>
+ *   <li>{@link PathfinderGuard} clamps the pathfinder's {@code allowBreak} and {@code allowPlace}
+ *       off. It governs blocks the pathfinder would decide to remove on its own to clear a route -
+ *       which, left at its defaults, it absolutely will.</li>
+ * </ul>
+ * The net result is that the only blocks this plugin can break are the enabled harvest stages and
+ * shulker boxes, and the only block it can place is a shulker box, on a spot proven not to sit on a
+ * budding amethyst growth face.
  *
- * <h2>How the break is driven</h2>
- * Through {@code PlayerInteractionManager} via a normal left click input, exactly as Zenith's own
- * interact process does. That buys real destroy progress against the held item, correct sequence
- * numbers, swing packets, the 5 tick inter block destroy delay and the rotation gate, all of which
- * a hand rolled {@code ServerboundPlayerActionPacket} would get wrong.
- *
- * <p>Note that {@code Bot#interactionTick} runs before the requested rotation is committed, so the
- * first tick of a new target only turns the head and the click lands on the second tick. The module
- * therefore holds one target until it breaks rather than re-picking every tick.
+ * <h2>Why breaking goes through inputs</h2>
+ * See {@link BreakDriver}. Short version: the vanilla interaction manager does destroy progress,
+ * sequence numbers and swing packets correctly, and hand-rolled break packets get vetoed.
  */
 public class AutoAmethystModule extends Module {
 
     /** Refuse to scan an absurd box; a geode interior is tens of blocks across, not hundreds. */
     private static final int MAX_BOX_VOLUME = 262_144; // 64^3
 
-    private enum State { SCAN, ENGAGE, SETTLE, MOVING }
+    private enum State { SCAN, ENGAGE, SETTLE, COLLECTING, RETURNING, DEPOSITING, MOVING }
 
     private final Timer scanTimer = Timers.tickTimer();
     private final Timer censusTimer = Timers.tickTimer();
     private final MovementDriver mover = new MovementDriver(this);
+    private final BreakDriver breaker = new BreakDriver();
+    private final DropCollector collector = new DropCollector(this);
+    private final DepositCycle depositCycle = new DepositCycle(this);
+    private final PathfinderGuard pathGuard = new PathfinderGuard(PLUGIN_CONFIG.internal);
 
     private State state = State.SCAN;
     private boolean paused = false;
     private String pauseReason = "";
     private volatile boolean reloadRequested = false;
 
-    /** Candidate cluster positions currently within reach, packed via {@link BlockPos#asLong}. */
+    /** Candidate harvest positions currently within reach, packed via {@link BlockPos#asLong}. */
     private final LongArrayList reachable = new LongArrayList();
     /** pos -> tick at which the position becomes eligible again. */
     private final Map<Long, Long> skipUntil = new HashMap<>();
@@ -102,9 +95,6 @@ public class AutoAmethystModule extends Module {
     private final Map<Long, Long> recentlyBroken = new HashMap<>();
 
     private long tickCounter = 0;
-    private boolean hasTarget = false;
-    private long targetPos = 0;
-    private int targetTicks = 0;
     private int settleTicks = 0;
     private int toolWaitTicks = 0;
     private int dwellTicks = 0;
@@ -112,15 +102,22 @@ public class AutoAmethystModule extends Module {
     private boolean visitedAnyWaypoint = false;
     private int consecutiveFailures = 0;
 
+    /** Stand position the collector is leashed to, so the bot cannot drift over hours. */
+    private double anchorX, anchorY, anchorZ;
+    private boolean anchorSet = false;
+
     // instrumentation
     private long breaks = 0;
     private long skipped = 0;
     private long reverts = 0;
     private long toolSwaps = 0;
+    private long deposits = 0;
     private int matureInBox = 0;
     private long sessionStartMs = 0;
-    private int shardsAtStart = -1;
-    private int shardsNow = -1;
+    private int yieldAtStart = -1;
+    private int yieldNow = -1;
+    private int yieldBeforeDeposit = 0;
+    private int depositedTotal = 0;
 
     @Override
     public boolean enabledSetting() {
@@ -138,26 +135,40 @@ public class AutoAmethystModule extends Module {
 
     @Override
     public void onEnable() {
+        // Do this first. Everything else assumes the pathfinder cannot mine or build.
+        pathGuard.apply();
         resetRuntime();
         sessionStartMs = System.currentTimeMillis();
-        shardsAtStart = -1;
-        breaks = skipped = reverts = toolSwaps = 0;
-        info("Enabled. Movement mode: {}", mode());
+        yieldAtStart = -1;
+        breaks = skipped = reverts = toolSwaps = deposits = 0;
+        depositedTotal = 0;
+        info("Enabled. Harvest mode: {}, movement: {}, pathfinder break/place clamped off",
+            mode(), movementMode());
+        if (!PLUGIN_CONFIG.harvest.protectBuds) {
+            warn("Bud protection is DISABLED - immature buds can be broken. "
+                + "Each one throws away up to ~2h17m of growth on that face.");
+        }
     }
 
     @Override
     public void onDisable() {
         mover.reset();
+        collector.reset();
+        depositCycle.reset();
+        breaker.reset();
         resetRuntime();
+        pathGuard.restore();
     }
 
     private void onBotStarting(final ClientBotTick.Starting event) {
-        // fresh connection: every cached position and in-flight break is meaningless
         resetRuntime();
     }
 
     private void onBotStopped(final ClientBotTick.Stopped event) {
         mover.reset();
+        collector.reset();
+        depositCycle.reset();
+        breaker.reset();
         resetRuntime();
     }
 
@@ -170,24 +181,38 @@ public class AutoAmethystModule extends Module {
         state = State.SCAN;
         paused = false;
         pauseReason = "";
-        hasTarget = false;
-        targetPos = 0;
-        targetTicks = 0;
         settleTicks = 0;
         toolWaitTicks = 0;
         dwellTicks = 0;
         visitedAnyWaypoint = false;
         consecutiveFailures = 0;
+        anchorSet = false;
         reachable.clear();
         skipUntil.clear();
         recentlyBroken.clear();
+        breaker.reset();
+        collector.reset();
+        depositCycle.reset();
         scanTimer.skip();
     }
 
     private AutoAmethystConfig.Harvest harvest() { return PLUGIN_CONFIG.harvest; }
 
-    private MovementDriver.Mode mode() {
+    private HarvestPolicy.Mode mode() {
+        return HarvestPolicy.parseMode(PLUGIN_CONFIG.harvest.mode);
+    }
+
+    private MovementDriver.Mode movementMode() {
         return MovementDriver.parseMode(PLUGIN_CONFIG.movement.mode);
+    }
+
+    /** The allowlist used for every harvest break. Bound to the current mode and config. */
+    private boolean isHarvestable(final Block block) {
+        return HarvestPolicy.isHarvestTarget(block, mode(), harvest());
+    }
+
+    private boolean isOurYield(final ItemStack stack) {
+        return HarvestPolicy.isHarvestYield(stack, mode());
     }
 
     // ------------------------------------------------------------------ tick
@@ -197,20 +222,34 @@ public class AutoAmethystModule extends Module {
         if (reloadRequested) {
             reloadRequested = false;
             mover.reset();
+            collector.reset();
+            depositCycle.reset();
+            breaker.reset();
             resetRuntime();
             info("Reloaded configuration");
         }
         if (paused) return;
         if (!CACHE.getPlayerCache().isAlive()) {
-            // dead: let AutoRespawn deal with it, and drop any half-finished break
-            if (hasTarget) abandonTarget("player died");
+            releaseBreak();
             return;
         }
         if (!validateSetup()) return;
 
-        if (shardsAtStart < 0) {
-            shardsAtStart = countShards();
-            shardsNow = shardsAtStart;
+        // The clamp is the only thing standing between the pathfinder and the budding blocks. If
+        // something else has written those settings while we were running, stop rather than mine.
+        if (!pathGuard.stillClamped()) {
+            pathGuard.apply();
+            if (!pathGuard.stillClamped()) {
+                pause("pathfinder allowBreak/allowPlace could not be clamped off");
+                return;
+            }
+        }
+
+        if (!anchorSet) setAnchorHere();
+
+        if (yieldAtStart < 0) {
+            yieldAtStart = countYield();
+            yieldNow = yieldAtStart;
         }
 
         try {
@@ -218,6 +257,9 @@ public class AutoAmethystModule extends Module {
                 case SCAN -> tickScan();
                 case ENGAGE -> tickEngage();
                 case SETTLE -> tickSettle();
+                case COLLECTING -> tickCollecting();
+                case RETURNING -> tickReturning();
+                case DEPOSITING -> tickDepositing();
                 case MOVING -> tickMoving();
             }
         } catch (final Exception e) {
@@ -244,9 +286,13 @@ public class AutoAmethystModule extends Module {
             pause("geode box is " + volume + " blocks, over the " + MAX_BOX_VOLUME + " limit");
             return false;
         }
-        final MovementDriver.Mode m = mode();
+        final MovementDriver.Mode m = movementMode();
         if (m != MovementDriver.Mode.STATIONARY && PLUGIN_CONFIG.movement.waypoints.isEmpty()) {
             pause("movement mode " + m + " needs at least one waypoint");
+            return false;
+        }
+        if (PLUGIN_CONFIG.deposit.enabled && !PLUGIN_CONFIG.deposit.posSet) {
+            pause("deposit is on but no position is set - stand at the shulker and run 'deposit here'");
             return false;
         }
         return true;
@@ -257,12 +303,30 @@ public class AutoAmethystModule extends Module {
     private void tickScan() {
         if (!ensureTool()) return;
 
+        if (shouldDeposit()) {
+            yieldBeforeDeposit = countYield();
+            // The deposit run does its own pathing, so make sure a waypoint path is not still
+            // running underneath it and fighting for the same pathfinder.
+            mover.reset();
+            depositCycle.begin();
+            state = State.DEPOSITING;
+            return;
+        }
+
         if (scanTimer.tick(Math.max(1, harvest().rescanIntervalTicks))) {
             rescan();
         }
+
+        // Pick drops up before breaking more. Keeps the floor clean and the inventory honest.
+        if (PLUGIN_CONFIG.collection.enabled
+            && collector.hasWorkNear(this::isOurYield, anchorX, anchorY, anchorZ,
+                                     PLUGIN_CONFIG.collection.maxDistance)) {
+            state = State.COLLECTING;
+            return;
+        }
+
         if (reachable.isEmpty()) {
-            // nothing in reach; either wait here or move on to the next stand position
-            if (mode() == MovementDriver.Mode.STATIONARY) return;
+            if (movementMode() == MovementDriver.Mode.STATIONARY) return;
             if (++dwellTicks >= Math.max(0, PLUGIN_CONFIG.movement.dwellTicks)) {
                 beginNextWaypoint();
             }
@@ -274,66 +338,30 @@ public class AutoAmethystModule extends Module {
             reachable.clear();
             return;
         }
-        targetPos = pos;
-        hasTarget = true;
-        targetTicks = 0;
+        breaker.begin(BlockPos.getX(pos), BlockPos.getY(pos), BlockPos.getZ(pos));
         state = State.ENGAGE;
     }
 
     private void tickEngage() {
-        final int x = BlockPos.getX(targetPos);
-        final int y = BlockPos.getY(targetPos);
-        final int z = BlockPos.getZ(targetPos);
+        final long pos = breaker.target();
+        final BreakDriver.Status status = breaker.tick(
+            this::isHarvestable, effectiveReach(), harvest().requireLineOfSight,
+            harvest().maxBreakTicks, harvest().inputPriority);
 
-        if (!World.isChunkLoadedBlockPos(x, z)) {
-            abandonTarget("chunk unloaded");
-            return;
-        }
-
-        final Block block = World.getBlock(x, y, z);
-        if (block.isAir()) {
-            // Only credit a break we actually swung at. If it went to air before our first click
-            // landed, something else removed it and counting it would inflate the stats.
-            if (targetTicks > 0) {
-                onBreakSucceeded(x, y, z);
-            } else {
-                abandonTarget("target vanished before the first swing");
+        switch (status) {
+            case BUSY -> { }
+            case BROKEN -> onBreakSucceeded(pos);
+            case BLOCKED -> {
+                // A block that will not break in reasonable time gets parked so the loop cannot
+                // spin on it; anything else is transient and just needs a rescan.
+                final String reason = breaker.blockedReason();
+                if (reason.contains("no progress")) {
+                    skipTarget(pos, reason);
+                } else {
+                    abandonTarget(reason);
+                }
             }
-            return;
         }
-        // HARD GUARD. Anything that is not a mature cluster is never swung at, full stop.
-        if (block != BlockRegistry.AMETHYST_CLUSTER) {
-            abandonTarget("block became " + block.name());
-            return;
-        }
-        if (++targetTicks > Math.max(20, harvest().maxBreakTicks)) {
-            skipTarget(x, y, z, "no progress after " + targetTicks + " ticks (ghost block?)");
-            return;
-        }
-        if (!isUsableHeldPickaxe()) {
-            abandonTarget("held item is no longer a usable pickaxe");
-            return;
-        }
-
-        final Position center = World.blockInteractionCenter(x, y, z);
-        final Vector2f rot = RotationHelper.rotationTo(center.x(), center.y(), center.z());
-        if (!canEngage(x, y, z, rot)) {
-            abandonTarget("lost reach or line of sight");
-            return;
-        }
-
-        INPUTS.submit(InputRequest.builder()
-            .owner(this)
-            .input(Input.builder()
-                .hand(Hand.MAIN_HAND)
-                .clickRequiresRotation(true)
-                .clickTarget(new ClickTarget.BlockPosition(x, y, z))
-                .leftClick(true)
-                .build())
-            .yaw(rot.getX())
-            .pitch(rot.getY())
-            .priority(harvest().inputPriority)
-            .build());
     }
 
     private void tickSettle() {
@@ -341,19 +369,100 @@ public class AutoAmethystModule extends Module {
         state = State.SCAN;
     }
 
-    private void tickMoving() {
-        final MovementDriver.Status status = mover.tick(mode(), PLUGIN_CONFIG.movement, harvest().inputPriority);
+    private void tickCollecting() {
+        final DropCollector.Status status = collector.tick(
+            this::isOurYield, PLUGIN_CONFIG.collection, anchorX, anchorY, anchorZ,
+            harvest().inputPriority);
         switch (status) {
-            case BUSY -> { }
-            case ARRIVED -> {
-                dwellTicks = 0;
+            case CHASING, RETURNING, IDLE -> { }
+            case DONE -> {
+                yieldNow = countYield();
+                state = State.RETURNING;
+            }
+            case FAILED -> {
+                warn("Drop collection gave up: {}", collector.failReason());
+                state = State.RETURNING;
+            }
+        }
+    }
+
+    private void tickReturning() {
+        final DropCollector.Status status = collector.tickReturn(
+            anchorX, anchorZ, PLUGIN_CONFIG.collection.returnTolerance,
+            PLUGIN_CONFIG.collection.sneakWhileCollecting, harvest().inputPriority,
+            PLUGIN_CONFIG.collection.stuckTicks);
+        switch (status) {
+            case RETURNING, CHASING, IDLE -> { }
+            case DONE -> {
                 scanTimer.skip();
                 state = State.SCAN;
             }
             case FAILED -> {
-                pause("movement failed: " + mover.failReason());
+                // not fatal: we are still somewhere sane, just re-anchor and carry on
+                warn("Could not walk back to the stand position: {}", collector.failReason());
+                setAnchorHere();
+                scanTimer.skip();
+                state = State.SCAN;
             }
         }
+    }
+
+    private void tickDepositing() {
+        final DepositCycle.Status status = depositCycle.tick(
+            this::isOurYield, PLUGIN_CONFIG.deposit, effectiveReach(),
+            harvest().requireLineOfSight, harvest().inputPriority);
+        switch (status) {
+            case BUSY -> { }
+            case DONE -> {
+                deposits++;
+                final int after = countYield();
+                // Carried yield drops when a deposit succeeds, so bank the difference or the
+                // session total would read as a loss every time the shulker is filled.
+                if (yieldBeforeDeposit > after) depositedTotal += yieldBeforeDeposit - after;
+                yieldNow = after;
+                yieldAtStart = after;
+                // we walked to the shulker, so the old stand position no longer applies
+                setAnchorHere();
+                scanTimer.skip();
+                state = State.SCAN;
+            }
+            case FAILED -> pause("deposit failed: " + depositCycle.failReason());
+        }
+    }
+
+    private void tickMoving() {
+        final MovementDriver.Status status = mover.tick(
+            movementMode(), PLUGIN_CONFIG.movement, harvest().inputPriority);
+        switch (status) {
+            case BUSY -> { }
+            case ARRIVED -> {
+                dwellTicks = 0;
+                setAnchorHere();
+                // drops that were unreachable from the last stand position may well be reachable
+                // from this one
+                collector.clearUnreachable();
+                scanTimer.skip();
+                state = State.SCAN;
+            }
+            case FAILED -> pause("movement failed: " + mover.failReason());
+        }
+    }
+
+    // ------------------------------------------------------------------ deposit trigger
+
+    private boolean shouldDeposit() {
+        final AutoAmethystConfig.Deposit cfg = PLUGIN_CONFIG.deposit;
+        if (!cfg.enabled || !cfg.posSet) return false;
+        return freeInventorySlots() <= Math.max(0, cfg.triggerFreeSlots);
+    }
+
+    private int freeInventorySlots() {
+        final List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
+        int free = 0;
+        for (int slot = 9; slot <= 44; slot++) {
+            if (inv.get(slot) == Container.EMPTY_STACK) free++;
+        }
+        return free;
     }
 
     // ------------------------------------------------------------------ scanning
@@ -371,7 +480,7 @@ public class AutoAmethystModule extends Module {
         reachable.clear();
         expireSkips();
         checkForReverts();
-        shardsNow = countShards();
+        yieldNow = countYield();
 
         final AutoAmethystConfig.Harvest h = harvest();
         final double reach = effectiveReach();
@@ -388,7 +497,7 @@ public class AutoAmethystModule extends Module {
             for (int z = loZ; z <= hiZ; z++) {
                 if (!World.isChunkLoadedBlockPos(x, z)) continue;
                 for (int y = loY; y <= hiY; y++) {
-                    if (World.getBlock(x, y, z) != BlockRegistry.AMETHYST_CLUSTER) continue;
+                    if (!isHarvestable(World.getBlock(x, y, z))) continue;
                     final long pos = BlockPos.asLong(x, y, z);
                     if (isSkipped(pos)) continue;
                     if (!withinReach(x, y, z, reach)) continue;
@@ -410,7 +519,7 @@ public class AutoAmethystModule extends Module {
             for (int z = h.minZ; z <= h.maxZ; z++) {
                 if (!World.isChunkLoadedBlockPos(x, z)) continue;
                 for (int y = h.minY; y <= h.maxY; y++) {
-                    if (World.getBlock(x, y, z) == BlockRegistry.AMETHYST_CLUSTER) count++;
+                    if (isHarvestable(World.getBlock(x, y, z))) count++;
                 }
             }
         }
@@ -431,17 +540,18 @@ public class AutoAmethystModule extends Module {
     private long pickNearestTarget() {
         long best = Long.MIN_VALUE;
         double bestDist = Double.MAX_VALUE;
+        final double reach = effectiveReach();
         final LongIterator it = reachable.iterator();
         while (it.hasNext()) {
             final long pos = it.nextLong();
             final int x = BlockPos.getX(pos);
             final int y = BlockPos.getY(pos);
             final int z = BlockPos.getZ(pos);
-            if (World.getBlock(x, y, z) != BlockRegistry.AMETHYST_CLUSTER) continue;
+            if (!isHarvestable(World.getBlock(x, y, z))) continue;
             if (isSkipped(pos)) continue;
             final Position c = World.blockInteractionCenter(x, y, z);
             final Vector2f rot = RotationHelper.rotationTo(c.x(), c.y(), c.z());
-            if (!canEngage(x, y, z, rot)) continue;
+            if (!BreakDriver.canEngage(x, y, z, rot, reach, harvest().requireLineOfSight)) continue;
             final double d = MathHelper.distanceSq3d(c.x(), c.y(), c.z(), BOT.getX(), BOT.getEyeY(), BOT.getZ());
             if (d < bestDist) {
                 bestDist = d;
@@ -449,29 +559,6 @@ public class AutoAmethystModule extends Module {
             }
         }
         return best;
-    }
-
-    /**
-     * True when the block can actually be hit from here with the given rotation.
-     *
-     * <p>Two separate questions. First, does the aimed ray intersect the target's own interaction
-     * box within reach - that is what the engine will re-run when the click executes, so if it
-     * fails the click is a no-op. Second, is the target the <i>first</i> thing that ray hits.
-     * Zenith's block-target raycast deliberately ignores intervening blocks, so without this second
-     * check the bot would happily mine clusters through a wall, which is not something a vanilla
-     * client can do.
-     */
-    private boolean canEngage(final int x, final int y, final int z, final Vector2f rot) {
-        final double reach = effectiveReach();
-        final BlockRaycastResult through =
-            RaycastHelper.playerEyeRaycastThroughToBlockTarget(x, y, z, rot.getX(), rot.getY(), reach);
-        if (!through.hit() || through.x() != x || through.y() != y || through.z() != z) return false;
-
-        if (!harvest().requireLineOfSight) return true;
-
-        final BlockRaycastResult first = RaycastHelper.blockRaycastFromPos(
-            BOT.getX(), BOT.getEyeY(), BOT.getZ(), rot.getX(), rot.getY(), reach, false);
-        return first.hit() && first.x() == x && first.y() == y && first.z() == z;
     }
 
     /**
@@ -488,24 +575,20 @@ public class AutoAmethystModule extends Module {
 
     // ------------------------------------------------------------------ target lifecycle
 
-    private void onBreakSucceeded(final int x, final int y, final int z) {
+    private void onBreakSucceeded(final long pos) {
         breaks++;
         consecutiveFailures = 0;
-        recentlyBroken.put(BlockPos.asLong(x, y, z), tickCounter);
-        reachable.rem(BlockPos.asLong(x, y, z));
-        clearTarget();
+        recentlyBroken.put(pos, tickCounter);
+        reachable.rem(pos);
         settleTicks = Math.max(1, harvest().interBreakDelayTicks);
         state = State.SETTLE;
-        logHarvest(x, y, z);
+        logHarvest(pos);
     }
 
     /** Target is no longer valid but is not the target's fault; re-scan and pick another. */
     private void abandonTarget(final String reason) {
-        if (hasTarget) {
-            debug("Abandoned target {}: {}", describe(targetPos), reason);
-        }
-        releaseInputs();
-        clearTarget();
+        debug("Abandoned target: {}", reason);
+        releaseBreak();
         if (++consecutiveFailures >= Math.max(1, harvest().maxConsecutiveFailures)) {
             pause("gave up after " + consecutiveFailures + " consecutive failed targets (last: " + reason + ")");
             return;
@@ -515,36 +598,19 @@ public class AutoAmethystModule extends Module {
     }
 
     /** Target is bad; blacklist it for a while so the loop cannot spin on it. */
-    private void skipTarget(final int x, final int y, final int z, final String reason) {
+    private void skipTarget(final long pos, final String reason) {
         skipped++;
-        final long pos = BlockPos.asLong(x, y, z);
         skipUntil.put(pos, tickCounter + Math.max(20, harvest().skipCooldownTicks));
         reachable.rem(pos);
         warn("Skipping {}: {}", describe(pos), reason);
-        releaseInputs();
-        clearTarget();
+        releaseBreak();
         scanTimer.skip();
         state = State.SCAN;
     }
 
-    private void clearTarget() {
-        hasTarget = false;
-        targetPos = 0;
-        targetTicks = 0;
-    }
-
-    /**
-     * Stops an in-flight break cleanly. Submitting an empty input at our own priority makes the
-     * interaction manager see "not left clicking" next tick, which sends the ABORT_DESTROY_BLOCK a
-     * vanilla client would send instead of just going silent mid-dig.
-     */
-    private void releaseInputs() {
-        if (!hasTarget) return;
-        INPUTS.submit(InputRequest.builder()
-            .owner(this)
-            .input(Input.builder().build())
-            .priority(harvest().inputPriority)
-            .build());
+    private void releaseBreak() {
+        breaker.release(harvest().inputPriority);
+        breaker.reset();
     }
 
     /**
@@ -571,7 +637,7 @@ public class AutoAmethystModule extends Module {
             final int y = BlockPos.getY(pos);
             final int z = BlockPos.getZ(pos);
             if (!World.isChunkLoadedBlockPos(x, z)) continue;
-            if (World.getBlock(x, y, z) == BlockRegistry.AMETHYST_CLUSTER) {
+            if (isHarvestable(World.getBlock(x, y, z))) {
                 it.remove();
                 if (breaks > 0) breaks--;
                 reverts++;
@@ -591,6 +657,13 @@ public class AutoAmethystModule extends Module {
     }
 
     // ------------------------------------------------------------------ movement
+
+    private void setAnchorHere() {
+        anchorX = CACHE.getPlayerCache().getX();
+        anchorY = CACHE.getPlayerCache().getY();
+        anchorZ = CACHE.getPlayerCache().getZ();
+        anchorSet = true;
+    }
 
     private void beginNextWaypoint() {
         // Snapshot: the command thread can add to or clear this list between our size check and our
@@ -612,7 +685,7 @@ public class AutoAmethystModule extends Module {
             return;
         }
         dwellTicks = 0;
-        mover.begin(mode(), wp[0], wp[1], wp[2]);
+        mover.begin(movementMode(), wp[0], wp[1], wp[2]);
         state = State.MOVING;
     }
 
@@ -635,52 +708,55 @@ public class AutoAmethystModule extends Module {
     // ------------------------------------------------------------------ tool handling
 
     /**
-     * Makes sure a usable pickaxe is in hand. Returns false when the caller should wait a tick,
-     * either because a hotbar swap is in flight or because harvesting is paused.
+     * Makes sure the right pickaxe for the mode is in hand. Returns false when the caller should
+     * wait a tick, either because a swap is in flight or because harvesting is paused.
      *
-     * <p>Only ever called outside {@link State#ENGAGE}: changing the held item mid-break resets
-     * destroy progress, because the interaction manager keys its "same target" test on the stack.
+     * <p>Never called during {@link State#ENGAGE}: changing the held item mid-break resets destroy
+     * progress, because the interaction manager keys its "same target" test on the stack.
      */
     private boolean ensureTool() {
         final AutoAmethystConfig.Tool cfg = PLUGIN_CONFIG.tool;
         if (!cfg.enabled) return true;
+        final HarvestPolicy.Mode m = mode();
 
         final ItemStack held = CACHE.getPlayerCache().getEquipment(EquipmentSlot.MAIN_HAND);
-        final boolean heldOk = isUsablePickaxe(held) && !needsSwap(held);
+        final boolean heldOk = HarvestPolicy.isCorrectPickaxe(held, m) && !needsSwap(held);
 
-        final int slot = findBestPickaxe();
+        final int slot = findBestPickaxe(m);
         if (slot < 0) {
             if (heldOk) {
-                // holding the only healthy pickaxe there is
                 toolWaitTicks = 0;
                 return true;
             }
             if (cfg.pauseWhenNoTool) {
-                pause("no usable pickaxe above " + cfg.swapAtDurabilityPercent + "% durability");
+                pause(m == HarvestPolicy.Mode.SILK
+                    ? "no Silk Touch pickaxe above " + cfg.swapAtDurabilityPercent + "% durability"
+                    : "no non-Silk pickaxe above " + cfg.swapAtDurabilityPercent + "% durability");
                 return false;
             }
             toolWaitTicks = 0;
-            if (isUsablePickaxe(held)) return true;
-            if (tickCounter % 200 == 0) {
-                warn("No usable pickaxe in inventory and nothing worth swapping to; idling");
-            }
+            if (HarvestPolicy.isCorrectPickaxe(held, m)) return true;
+            if (tickCounter % 200 == 0) warn("No suitable pickaxe in inventory; idling");
             return false;
         }
 
         if (heldOk) {
-            // Fortune is worth a swap: a Fortune III pickaxe averages 8.8 shards per cluster
-            // against 4 with no Fortune, so quietly grinding away with the wrong pickaxe would
-            // silently halve the farm's output.
+            // Fortune is worth a swap in SHARDS mode: Fortune III averages 8.8 shards per cluster
+            // against 4 with none, so grinding away with the wrong pickaxe silently halves output.
+            // In SILK mode Fortune does nothing, so leave a working pickaxe alone.
+            if (m == HarvestPolicy.Mode.SILK) {
+                toolWaitTicks = 0;
+                return true;
+            }
             final ItemStack best = CACHE.getPlayerCache().getPlayerInventory().get(slot);
-            if (enchantLevel(best, EnchantmentRegistry.FORTUNE.get())
-                <= enchantLevel(held, EnchantmentRegistry.FORTUNE.get())) {
+            if (HarvestPolicy.enchantLevel(best, EnchantmentRegistry.FORTUNE.get())
+                <= HarvestPolicy.enchantLevel(held, EnchantmentRegistry.FORTUNE.get())) {
                 toolWaitTicks = 0;
                 return true;
             }
         }
 
         if (slot >= 36 && slot <= 44 && CACHE.getPlayerCache().getHeldItemSlot() == slot - 36) {
-            // already holding the best available pickaxe
             toolWaitTicks = 0;
             return true;
         }
@@ -709,45 +785,26 @@ public class AutoAmethystModule extends Module {
         return false;
     }
 
-    private boolean isUsableHeldPickaxe() {
-        if (!PLUGIN_CONFIG.tool.enabled) return true;
-        return isUsablePickaxe(CACHE.getPlayerCache().getEquipment(EquipmentSlot.MAIN_HAND));
-    }
-
-    /**
-     * A pickaxe we are willing to swing at a cluster.
-     *
-     * <p>Silk Touch is disqualifying rather than merely suboptimal: it drops the cluster block and
-     * zero shards, so a silk pickaxe turns the whole farm into a no-op that still burns durability.
-     */
-    private boolean isUsablePickaxe(final @Nullable ItemStack stack) {
-        if (stack == null || stack == Container.EMPTY_STACK) return false;
-        final ItemData data = ItemRegistry.REGISTRY.get(stack.getId());
-        if (data == null) return false;
-        final ToolTag tag = data.toolTag();
-        if (tag == null || tag.type() != ToolType.PICKAXE) return false;
-        return !(PLUGIN_CONFIG.tool.refuseSilkTouch && hasEnchant(stack, EnchantmentRegistry.SILK_TOUCH.get()));
-    }
-
-    private boolean needsSwap(final ItemStack stack) {
+    private boolean needsSwap(final @Nullable ItemStack stack) {
+        if (stack == null || stack == Container.EMPTY_STACK) return true;
         final int pct = durabilityPercent(stack);
         return pct >= 0 && pct <= PLUGIN_CONFIG.tool.swapAtDurabilityPercent;
     }
 
     /**
-     * Best pickaxe in the inventory: healthy first, then most Fortune, then most durability left.
-     * Returns -1 when nothing qualifies.
+     * Best pickaxe for the mode: correct Silk Touch state, healthy, then most Fortune, then most
+     * durability. Returns -1 when nothing qualifies.
      */
-    private int findBestPickaxe() {
+    private int findBestPickaxe(final HarvestPolicy.Mode m) {
         final List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
         int bestSlot = -1;
         int bestFortune = -1;
         int bestRemaining = -1;
         for (int slot = 9; slot <= 44; slot++) {
             final ItemStack stack = inv.get(slot);
-            if (!isUsablePickaxe(stack)) continue;
+            if (!HarvestPolicy.isCorrectPickaxe(stack, m)) continue;
             if (needsSwap(stack)) continue;
-            final int fortune = enchantLevel(stack, EnchantmentRegistry.FORTUNE.get());
+            final int fortune = HarvestPolicy.enchantLevel(stack, EnchantmentRegistry.FORTUNE.get());
             final int remaining = remainingDurability(stack);
             if (fortune > bestFortune || (fortune == bestFortune && remaining > bestRemaining)) {
                 bestFortune = fortune;
@@ -781,52 +838,50 @@ public class AutoAmethystModule extends Module {
         return (int) ((remaining * 100L) / max);
     }
 
-    private static int enchantLevel(final ItemStack stack, final @Nullable EnchantmentData enchantment) {
-        if (enchantment == null) return 0;
-        return BOT.getInteractions().getEnchantmentLevel(stack, enchantment);
-    }
-
-    private static boolean hasEnchant(final ItemStack stack, final @Nullable EnchantmentData enchantment) {
-        return enchantLevel(stack, enchantment) > 0;
-    }
-
     // ------------------------------------------------------------------ instrumentation
 
     /**
-     * Counts shards carried. Deliberately skipped while a container window is open: the player
+     * Counts carried yield. Deliberately skipped while a container window is open: the player
      * inventory cache does not re-sync until the container closes, so a count taken then is stale.
      */
-    private int countShards() {
+    private int countYield() {
         if (CACHE.getPlayerCache().getInventoryCache().getOpenContainer().getContainerId() != 0) {
-            return shardsNow;
+            return yieldNow;
         }
         final List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
-        final int shardId = ItemRegistry.AMETHYST_SHARD.id();
         int total = 0;
         for (int slot = 9; slot <= 45; slot++) {
             final ItemStack stack = inv.get(slot);
             if (stack == Container.EMPTY_STACK) continue;
-            if (stack.getId() == shardId) total += stack.getAmount();
+            if (isOurYield(stack)) total += stack.getAmount();
         }
         return total;
     }
 
-    public int shardsGained() {
-        if (shardsAtStart < 0 || shardsNow < 0) return 0;
-        return Math.max(0, shardsNow - shardsAtStart);
+    /**
+     * Yield collected this session.
+     *
+     * <p>Counts what is carried, so a deposit run that moves stacks into a shulker would read as a
+     * loss. The running total is therefore accumulated across deposits rather than taken as a raw
+     * difference.
+     */
+    public int yieldGained() {
+        if (yieldAtStart < 0 || yieldNow < 0) return depositedTotal;
+        return Math.max(0, yieldNow - yieldAtStart) + depositedTotal;
     }
 
-    public double shardsPerHour() {
+    public double yieldPerHour() {
         final long elapsed = System.currentTimeMillis() - sessionStartMs;
         if (sessionStartMs == 0 || elapsed < TimeUnit.SECONDS.toMillis(30)) return 0;
-        return shardsGained() * (double) TimeUnit.HOURS.toMillis(1) / elapsed;
+        return yieldGained() * (double) TimeUnit.HOURS.toMillis(1) / elapsed;
     }
 
     private void maybeLogSummary() {
         final int interval = PLUGIN_CONFIG.stats.summaryIntervalTicks;
         if (interval <= 0 || tickCounter % interval != 0) return;
-        info("breaks={} shards={} shards/h={} mature-in-box={} skipped={} reverts={} toolSwaps={}",
-            breaks, shardsGained(), String.format("%.1f", shardsPerHour()), matureInBox, skipped, reverts, toolSwaps);
+        info("breaks={} yield={} per-hour={} mature-in-box={} skipped={} reverts={} toolSwaps={} deposits={}",
+            breaks, yieldGained(), String.format("%.1f", yieldPerHour()), matureInBox,
+            skipped, reverts, toolSwaps, deposits);
     }
 
     /**
@@ -834,10 +889,10 @@ public class AutoAmethystModule extends Module {
      * absolute coordinates are explicitly enabled - a harvest log is exactly the kind of file that
      * ends up pasted into a chat or committed by accident, and these are real anarchy coordinates.
      */
-    private void logHarvest(final int x, final int y, final int z) {
+    private void logHarvest(final long pos) {
         if (!PLUGIN_CONFIG.stats.logToFile) return;
-        final String line = Instant.now() + " break " + describe(BlockPos.asLong(x, y, z))
-            + " breaks=" + breaks + " shards=" + shardsGained() + System.lineSeparator();
+        final String line = Instant.now() + " break " + describe(pos)
+            + " breaks=" + breaks + " yield=" + yieldGained() + System.lineSeparator();
         final String file = PLUGIN_CONFIG.stats.logFile;
         // Off the tick thread. A blocking append per break is small, but the bot tick loop is the
         // one place where a stalled disk turns into missed movement packets.
@@ -873,9 +928,10 @@ public class AutoAmethystModule extends Module {
         if (paused && reason.equals(pauseReason)) return;
         paused = true;
         pauseReason = reason;
-        releaseInputs();
-        clearTarget();
+        releaseBreak();
         mover.reset();
+        collector.reset();
+        depositCycle.reset();
         warn("Paused: {}", reason);
         inGameAlertActivePlayer("<red>Paused:<reset> " + reason);
     }
@@ -886,17 +942,23 @@ public class AutoAmethystModule extends Module {
         pauseReason = "";
         consecutiveFailures = 0;
         state = State.SCAN;
+        anchorSet = false;
         scanTimer.skip();
     }
 
     public boolean isPaused() { return paused; }
     public String pauseReason() { return pauseReason; }
-    public String stateName() { return paused ? "PAUSED" : state.name(); }
+    public String stateName() {
+        if (paused) return "PAUSED";
+        if (state == State.DEPOSITING) return "DEPOSIT:" + depositCycle.phaseName();
+        return state.name();
+    }
     public long breaks() { return breaks; }
     public long skippedCount() { return skipped; }
     public long reverts() { return reverts; }
     public long toolSwaps() { return toolSwaps; }
+    public long deposits() { return deposits; }
     public int matureInBox() { return matureInBox; }
     public int reachableCount() { return reachable.size(); }
-    public int waypointIndex() { return waypointIndex; }
+    public boolean pathfinderClamped() { return pathGuard.isApplied() && pathGuard.stillClamped(); }
 }

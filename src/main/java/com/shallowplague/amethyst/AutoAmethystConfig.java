@@ -22,6 +22,39 @@ public class AutoAmethystConfig {
         public boolean enabled = false;
 
         /**
+         * SHARDS - break only fully grown clusters with a non-Silk pickaxe. Fortune III averages
+         * 8.8 shards per cluster.
+         *
+         * SILK - break the enabled growth stages with a Silk Touch pickaxe, collecting the blocks
+         * themselves. Note Fortune is worthless on immature buds: they drop <b>nothing at all</b>
+         * without Silk Touch, so there is no drop for Fortune to multiply. Only the terminal cluster
+         * stage has a non-silk drop.
+         */
+        public String mode = "SHARDS";
+
+        /**
+         * <b>Master bud protection. Leave this on.</b>
+         *
+         * <p>While true it is impossible for the plugin to break an immature bud, whatever else is
+         * configured - the per-stage toggles below are ignored entirely. Breaking a bud throws away
+         * the growth already invested in that face, up to ~2h17m, for a block that is only worth
+         * having if you specifically want bud blocks.
+         *
+         * <p>Turning this off is a deliberate two-step act: you must also select SILK mode and
+         * enable the individual stage. Nothing about normal shard farming can trip it.
+         */
+        public boolean protectBuds = true;
+
+        /** SILK mode: harvest fully grown clusters as blocks. Safe - they are terminal anyway. */
+        public boolean silkHarvestCluster = true;
+        /** SILK mode: harvest large buds. Requires protectBuds = false. */
+        public boolean silkHarvestLargeBud = false;
+        /** SILK mode: harvest medium buds. Requires protectBuds = false. */
+        public boolean silkHarvestMediumBud = false;
+        /** SILK mode: harvest small buds. Requires protectBuds = false. */
+        public boolean silkHarvestSmallBud = false;
+
+        /**
          * Inclusive bounding box of the geode interior. Only {@code amethyst_cluster} blocks inside
          * this box are ever considered targets. Set with {@code autoamethyst box corner1|corner2}.
          */
@@ -157,6 +190,107 @@ public class AutoAmethystConfig {
          * overshooting stand positions. Costs nothing that matters, since growth is the bottleneck.
          */
         public boolean sneakWhileWalking = true;
+    }
+
+    public final Collection collection = new Collection();
+
+    public static final class Collection {
+        /**
+         * Walk onto dropped items instead of relying on the ~1 block vanilla pickup radius. A
+         * broken block's drop can fly a couple of blocks, so without this the farm slowly leaks
+         * yield onto the floor to despawn after five minutes.
+         */
+        public boolean enabled = true;
+
+        /**
+         * Leash, in blocks from the stand position. The bot will not chase a drop further than
+         * this, and walks back to its stand position afterwards so it cannot drift over time.
+         */
+        public double maxDistance = 6.0;
+
+        /** Give up on one drop after this long. */
+        public int chaseTimeoutTicks = 120;
+
+        /** Ticks of no measurable movement before a chase is considered stuck. */
+        public int stuckTicks = 40;
+
+        /** Sneak while collecting. Keeps vanilla ledge protection on inside the rig. */
+        public boolean sneakWhileCollecting = true;
+
+        /** How close to the stand position counts as "back". */
+        public double returnTolerance = 0.6;
+    }
+
+    public final Deposit deposit = new Deposit();
+
+    public static final class Deposit {
+        /**
+         * Empty the harvest into a shulker box at a fixed position, replacing it when it fills.
+         * Full shulkers accumulate in the bot's inventory for you to collect.
+         */
+        public boolean enabled = false;
+
+        /** Position of the deposit shulker. Set with {@code autoamethyst deposit here}. */
+        public boolean posSet = false;
+        public int x = 0;
+        public int y = 0;
+        public int z = 0;
+
+        /** Start a deposit run when this many inventory slots or fewer are free. */
+        public int triggerFreeSlots = 4;
+
+        /**
+         * When the shulker fills: break it (shulkers keep their contents), pick it up, and place a
+         * fresh empty one. Turning this off makes a full shulker pause the module instead.
+         */
+        public boolean replaceWhenFull = true;
+
+        /** Ticks between container clicks. Unthrottled click streams get windows closed on you. */
+        public int stepSettleTicks = 6;
+
+        /**
+         * Abort a stuck deposit phase after this long rather than grinding. A full transfer is two
+         * clicks per stack at {@link #stepSettleTicks} apiece, so this has to comfortably exceed
+         * 36 x 2 x stepSettleTicks or a legitimately long transfer will look like a hang.
+         */
+        public int phaseTimeoutTicks = 1200;
+
+        /** Placement attempts before giving up on putting a shulker at the deposit position. */
+        public int maxPlaceAttempts = 5;
+
+        /** Give up breaking the full shulker after this long. */
+        public int breakTimeoutTicks = 200;
+
+        /** How far the bot may wander to pick up the broken shulker. */
+        public double collectRadius = 5.0;
+
+        public int collectTimeoutTicks = 200;
+
+        /** Refuse to walk further than this to reach the deposit position. */
+        public double maxTravelDistance = 64.0;
+
+        /** Consecutive transfer steps with no effect before giving up. */
+        public int maxStalledSteps = 6;
+    }
+
+    public final Internal internal = new Internal();
+
+    /**
+     * Bookkeeping, not settings. Do not edit by hand.
+     *
+     * <p>The module clamps Zenith's {@code pathfinder.allowBreak} / {@code allowPlace} off while it
+     * runs. Zenith persists its own config on shutdown and on every command, so those clamped
+     * values reach {@code config.json} - meaning if the proxy is killed while the module is enabled,
+     * the user's original settings would be gone and the next startup would snapshot the clamped
+     * values as if they were the originals. Keeping the snapshot here, in a file that survives the
+     * crash, lets the module put things back on the next run.
+     */
+    public static final class Internal {
+        public boolean pathfinderClampActive = false;
+        public boolean savedAllowBreak = true;
+        public boolean savedAllowPlace = true;
+        public boolean savedAllowParkourPlace = false;
+        public List<String> savedAllowBreakAnyway = new ArrayList<>();
     }
 
     public final Stats stats = new Stats();
