@@ -94,8 +94,9 @@ public final class DropCollector {
     private Mode mode = Mode.NONE;
     private long issuedSignature = 0;
     private int reissueCooldown = 0;
-    private int chaseTicks = 0;
     private int idleTicks = 0;
+    /** Ticks since a shard was last actually picked up. Only a real pickup clears it. */
+    private int noProgressTicks = 0;
     private int nudgeTicks = 0;
     private int nudgeStuck = 0;
     private int nudgeTarget = -1;
@@ -127,6 +128,22 @@ public final class DropCollector {
     public int truncated() { return truncated; }
 
     public String modeName() { return mode.name(); }
+
+    /** Ticks since a shard was last actually picked up. */
+    public int noProgressTicks() { return noProgressTicks; }
+
+    // Nearest drop being worked on, for the "why is it not collecting" output. Positions are raw
+    // world coords; the caller renders them box-relative so no real coordinates reach a log.
+    public boolean hasNearestDrop() { return !visible.isEmpty(); }
+    public int nearestDropX() { return visible.isEmpty() ? 0 : visible.get(0).x(); }
+    public int nearestDropY() { return visible.isEmpty() ? 0 : visible.get(0).y(); }
+    public int nearestDropZ() { return visible.isEmpty() ? 0 : visible.get(0).z(); }
+    public double nearestDropDistance() {
+        return visible.isEmpty() ? -1 : Math.sqrt(visible.get(0).distSq());
+    }
+    public boolean nearestDropNudgeBlocked() {
+        return !visible.isEmpty() && nudgeBlocked.containsKey(visible.get(0).id());
+    }
 
     public void reset() {
         stopAll();
@@ -167,11 +184,15 @@ public final class DropCollector {
         }
 
         // Any reduction in what is on the floor means the trip is working, whichever drop it was.
+        // This is the ONLY thing that clears noProgressTicks - it measures actual shards collected,
+        // not effort spent, so a busy-looking stall still terminates.
         if (lastItems >= 0 && groundItems < lastItems) {
-            chaseTicks = 0;
             idleTicks = 0;
             nudgeTicks = 0;
             nudgeStuck = 0;
+            noProgressTicks = 0;
+        } else {
+            noProgressTicks++;
         }
         lastItems = groundItems;
 
@@ -280,45 +301,48 @@ public final class DropCollector {
 
         if (mode != Mode.PATH_EXACT && mode != Mode.PATH_NEAR) {
             mode = Mode.PATH_EXACT;
-            chaseTicks = 0;
+            idleTicks = 0;
             issueGoal(n, signature, true);
             return Status.CHASING;
         }
         if (signature != issuedSignature && reissueCooldown <= 0) {
+            // The batch really changed - something was collected, or a new shard landed.
+            idleTicks = 0;
             issueGoal(n, signature, mode == Mode.PATH_EXACT);
             return Status.CHASING;
         }
 
         if (BARITONE.isActive()) {
             idleTicks = 0;
-            if (++chaseTicks > Math.max(60, cfg.chaseTimeoutTicks)) {
-                // Walking, but nothing collected for a long time. Park whichever drop it was most
-                // likely heading for and let the rest of the batch carry on.
-                cooldown.put(visible.get(0).id(), tick + Math.max(20, cfg.retryCooldownTicks));
-                stopPath();
-                return Status.CHASING;
-            }
+        } else {
+            // Standing still with a goal set: either the route is still being computed, or there is
+            // no route at all - which comes back immediately when every goal is unstandable.
+            idleTicks++;
+        }
+
+        final boolean noRoute = idleTicks > Math.max(10, cfg.pathGiveUpTicks);
+        // Backstop. Nothing has been picked up for a long time however busy the pathfinder looks -
+        // walking a route that never arrives, or repathing at an unreachable goal. This counter is
+        // reset only by an actual pickup, so no amount of internal churn can hold the cycle open.
+        final boolean gettingNowhere = noProgressTicks > Math.max(60, cfg.chaseTimeoutTicks);
+        if (!noRoute && !gettingNowhere) return Status.CHASING;
+
+        if (mode == Mode.PATH_EXACT) {
+            // Nothing can be stood on. Settle for getting beside them and let the hand walk finish
+            // the job.
+            mode = Mode.PATH_NEAR;
+            idleTicks = 0;
+            noProgressTicks = 0;
+            issueGoal(n, signature, false);
             return Status.CHASING;
         }
 
-        // Standing still with a goal set: either the route is still being computed, or there is no
-        // route at all - which comes back immediately when every goal is unstandable.
-        if (++idleTicks > Math.max(10, cfg.pathGiveUpTicks)) {
-            if (mode == Mode.PATH_EXACT) {
-                // Nothing can be stood on. Settle for getting beside them and let the hand walk
-                // finish it off.
-                mode = Mode.PATH_NEAR;
-                issueGoal(n, signature, false);
-                return Status.CHASING;
-            }
-            final long until = tick + Math.max(20, cfg.retryCooldownTicks);
-            for (int i = 0; i < n; i++) cooldown.put(visible.get(i).id(), until);
-            stopPath();
-            failReason = "no route to " + n + " drop(s), retrying within "
-                + (Math.max(20, cfg.retryCooldownTicks) / 20) + "s";
-            return Status.FAILED;
-        }
-        return Status.CHASING;
+        final long until = tick + Math.max(20, cfg.retryCooldownTicks);
+        for (int i = 0; i < n; i++) cooldown.put(visible.get(i).id(), until);
+        stopPath();
+        failReason = (noRoute ? "no route to " : "could not get to ") + n + " drop(s), retrying within "
+            + (Math.max(20, cfg.retryCooldownTicks) / 20) + "s";
+        return Status.FAILED;
     }
 
     private void issueGoal(final int n, final long signature, final boolean exact) {
@@ -332,30 +356,37 @@ public final class DropCollector {
         BARITONE.pathTo(n == 1 ? goals[0] : new GoalComposite(goals));
         issuedSignature = signature;
         reissueCooldown = REISSUE_COOLDOWN_TICKS;
-        idleTicks = 0;
     }
 
-    /** Identity of the batch handed to the pathfinder, so a change to it forces a re-issue. */
+    /**
+     * Identity of the batch handed to the pathfinder, so a change to it forces a re-issue.
+     *
+     * <p><b>Entity ids only, deliberately.</b> Including the drops' block positions livelocks the
+     * collector: an item at rest sits exactly on a block boundary, so {@code floorI(y)} flips
+     * between two values as position packets arrive, the signature churns, and the goal is
+     * re-issued every few ticks - which reset the give-up timer, so it never reached the threshold
+     * that escalates to a looser goal or writes the drop off. Symptom was a permanent
+     * {@code PATH_EXACT} with the pathfinder recalculating once a second and nothing collected.
+     * A drop that has genuinely rolled a block is close enough for the hand walk anyway.
+     */
     private long signature(final int n) {
         long h = 1125899906842597L;
         for (int i = 0; i < n; i++) {
-            final Drop d = visible.get(i);
-            h = h * 31 + d.id();
-            h = h * 31 + d.x();
-            h = h * 31 + d.y();
-            h = h * 31 + d.z();
+            h = h * 31 + visible.get(i).id();
         }
         return h;
     }
 
+    /**
+     * Drops any pathfinder goal. Stops the pathfinder unconditionally rather than only when this
+     * class believes it started it - while collecting, the collector owns the bot's movement, and a
+     * path left running from anywhere else would fight the hand walk for the same inputs.
+     */
     private void stopPath() {
-        if (mode == Mode.PATH_EXACT || mode == Mode.PATH_NEAR) {
-            if (BARITONE.isActive()) BARITONE.stop();
-        }
+        if (BARITONE.isActive()) BARITONE.stop();
         mode = Mode.NONE;
         issuedSignature = 0;
         reissueCooldown = 0;
-        chaseTicks = 0;
         idleTicks = 0;
     }
 
@@ -364,6 +395,7 @@ public final class DropCollector {
         nudgeTarget = -1;
         nudgeTicks = 0;
         nudgeStuck = 0;
+        noProgressTicks = 0;
     }
 
     // ------------------------------------------------------------------ sweep

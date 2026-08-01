@@ -1008,6 +1008,14 @@ public class AutoAmethystModule extends Module {
             + (collector.truncated() > 0
                 ? "  (+" + collector.truncated() + " beyond the batch cap)" : "")
             + "  collector=" + collector.modeName());
+        if (collector.hasNearestDrop()) {
+            out.add(String.format("nearest drop is %.2f blocks away at %s  walk-blocked=%s  "
+                    + "ticks since last pickup=%d",
+                collector.nearestDropDistance(),
+                describe(BlockPos.asLong(collector.nearestDropX(), collector.nearestDropY(),
+                                         collector.nearestDropZ())),
+                collector.nearestDropNudgeBlocked(), collector.noProgressTicks()));
+        }
         out.add("collection=" + (PLUGIN_CONFIG.collection.enabled ? "on" : "off")
             + "  deposit=" + (PLUGIN_CONFIG.deposit.enabled ? "on" : "off")
             + "  home=" + (PLUGIN_CONFIG.movement.homeSet ? "set" : "not set")
