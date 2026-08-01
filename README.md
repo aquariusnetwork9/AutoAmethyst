@@ -21,7 +21,7 @@ Fortune pickaxe it can find, and never touches anything else.
 | Guarantee | How |
 |---|---|
 | Only breaks what is on the allowlist | Every break goes through one `BreakDriver`, which re-checks the block against `HarvestPolicy` by identity on **every tick** immediately before the click — not once when the target is chosen. The list is: the enabled harvest stages, plus shulker boxes for the deposit. Nothing else, in any mode |
-| Never breaks budding amethyst | It is not in any allowlist, in any mode, under any configuration. It drops nothing with any tool including Silk Touch and is unobtainable — one stray break permanently deletes a growth site |
+| **Never breaks budding amethyst** | Vetoed unconditionally in three independent places: the target scanner, the breakable allowlist, and `BreakDriver` itself — the single line every break in the plugin passes through, which no caller, config combination or future refactor can route around. If the veto ever fires it logs an error, because reaching it means something else is wrong |
 | Never breaks immature buds by default | Double-gated behind `protectBuds` (on by default) **and** silk mode **and** a per-stage toggle. Normal shard farming cannot reach it |
 | Never places a block except a shulker | Shulkers are the only placeable, and only at the configured deposit spot |
 | Never blocks a growth face | A placement is refused if the target is not clear air or if any of its six face neighbours is a budding amethyst. Buds only grow into air, so a block on a growth face silently stops it producing — re-checked at the moment of placing, not just when configured |
@@ -81,10 +81,25 @@ back afterwards so it cannot drift over a long AFK run. A drop it genuinely cann
 off rather than chased forever.
 
 **Deposit** (`deposit here`, then `deposit on`). When free inventory slots drop to
-`triggerFreeSlots`, the bot goes to a shulker box at a fixed position, opens it, moves the harvest
-in, and closes it. When that shulker fills it breaks it (shulkers keep their contents), picks it up,
-and places a fresh empty one from inventory. Full shulkers accumulate in the bot's inventory for you
-to collect. Keep it stocked with empty shulkers.
+`triggerFreeSlots`, the bot runs a full deposit cycle:
+
+1. walk to the shulker box at the deposit position, open it, move the harvest in
+2. when that shulker fills: close it, break it (shulkers keep their contents), pick it up, place a
+   fresh empty one from inventory, carry on
+3. when there is nothing left to deposit: carry every filled shulker to the **storage chest** and
+   leave them there
+4. walk back to the stand position it was harvesting from
+
+Set the chest by standing next to it and running `deposit chest here` — it finds the nearest
+container within 4 blocks, so you never type a coordinate. Any container works. **The chest is never
+broken**; it is not on the breakable allowlist, and if the chest position ever holds something
+unexpected the run fails with a reason rather than clearing it.
+
+Step 4 is not cosmetic. Without it the bot finishes standing at the chest, re-anchors there, and in
+stationary mode never returns to the geode — the farm looks alive and produces nothing.
+
+Keep the bot stocked with empty shulkers. If the inventory fills with *filled* shulkers and no chest
+is set, the module pauses and tells you, rather than looping on a deposit that frees nothing.
 
 > **Transfers use `ClickItem`, not shift-click.** Stock Zenith's `ShiftClick` sends an empty
 > `changedSlots` map — its own source comments flag this as a likely anticheat problem. On a server
@@ -135,9 +150,11 @@ Any leg that stalls fails the leg and pauses the module with a reason, rather th
 2. Walk the bot to one interior corner of the geode: `autoamethyst box corner1`
 3. Walk to the opposite corner: `autoamethyst box corner2`
 4. Put Fortune III pickaxes (**no Silk Touch**) in the inventory.
-5. Optional but recommended — stand somewhere clear **outside** the geode, then
-   `autoamethyst deposit here` and `autoamethyst deposit on`. Carry a few empty shulker boxes.
-6. `autoamethyst on`
+5. Stand somewhere clear **outside** the geode and run `autoamethyst deposit here` — that is where
+   the working shulker goes. Carry a few empty shulker boxes.
+6. Stand next to your storage chest and run `autoamethyst deposit chest here`, then
+   `autoamethyst deposit on`.
+7. `autoamethyst on`
 
 For a multi-level rig, add stand positions by standing on each and running `autoamethyst waypoint
 add`, set the column with `autoamethyst column here`, then `autoamethyst mode scaffold`.
@@ -162,6 +179,8 @@ column here                 set the scaffolding column
 
 collect on/off              walk onto dropped items
 deposit here                set the shulker position from the bot's position
+deposit chest here          set the storage chest (nearest container within 4 blocks)
+deposit haul on/off         carry filled shulkers to the chest
 deposit on/off|status       shulker deposit cycle
 
 reach <blocks>              lower the reach cap (0 = server default)

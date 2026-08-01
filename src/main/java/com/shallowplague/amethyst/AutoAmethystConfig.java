@@ -236,6 +236,28 @@ public class AutoAmethystConfig {
         public int y = 0;
         public int z = 0;
 
+        /**
+         * Haul filled shulkers to a storage chest instead of carrying them around. Without this the
+         * bot accumulates full shulkers until it runs out of inventory and stops.
+         */
+        public boolean haulToChest = true;
+
+        /**
+         * Position of the storage chest. Set with {@code autoamethyst deposit chest here}. Any
+         * container works. It is opened and filled, never broken - the plugin cannot break a chest.
+         */
+        public boolean chestSet = false;
+        public int chestX = 0;
+        public int chestY = 0;
+        public int chestZ = 0;
+
+        /**
+         * How close counts as "back at the stand position" when the run walks the bot home. The
+         * return leg exists because a bot that finishes a deposit standing at the chest would
+         * re-anchor there and, in stationary mode, never harvest again.
+         */
+        public double returnTolerance = 2.0;
+
         /** Start a deposit run when this many inventory slots or fewer are free. */
         public int triggerFreeSlots = 4;
 

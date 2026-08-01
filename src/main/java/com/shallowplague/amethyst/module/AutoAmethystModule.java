@@ -112,6 +112,7 @@ public class AutoAmethystModule extends Module {
     private long reverts = 0;
     private long toolSwaps = 0;
     private long deposits = 0;
+    private int shulkersStored = 0;
     private int matureInBox = 0;
     private long sessionStartMs = 0;
     private int yieldAtStart = -1;
@@ -308,7 +309,10 @@ public class AutoAmethystModule extends Module {
             // The deposit run does its own pathing, so make sure a waypoint path is not still
             // running underneath it and fighting for the same pathfinder.
             mover.reset();
-            depositCycle.begin();
+            // Hand it the stand position so it can walk the bot back afterwards. Without that the
+            // bot finishes standing at the chest and, in stationary mode, never returns to the geode.
+            depositCycle.begin(
+                MathHelper.floorI(anchorX), MathHelper.floorI(anchorY), MathHelper.floorI(anchorZ));
             state = State.DEPOSITING;
             return;
         }
@@ -421,10 +425,21 @@ public class AutoAmethystModule extends Module {
                 if (yieldBeforeDeposit > after) depositedTotal += yieldBeforeDeposit - after;
                 yieldNow = after;
                 yieldAtStart = after;
-                // we walked to the shulker, so the old stand position no longer applies
+                shulkersStored = depositCycle.shulkersStored();
+                // The run walks itself back to the stand position, so re-anchor on where we
+                // actually ended up rather than assuming it succeeded.
                 setAnchorHere();
+                collector.clearUnreachable();
                 scanTimer.skip();
                 state = State.SCAN;
+                // If the run freed nothing, running it again immediately would just loop. The usual
+                // cause is an inventory full of filled shulkers with nowhere to put them.
+                if (freeInventorySlots() <= Math.max(0, PLUGIN_CONFIG.deposit.triggerFreeSlots)) {
+                    pause(PLUGIN_CONFIG.deposit.chestSet
+                        ? "deposit finished but the inventory is still full - check the storage chest"
+                        : "inventory is full of filled shulkers and no storage chest is set "
+                          + "(stand by a chest and run 'deposit chest here')");
+                }
             }
             case FAILED -> pause("deposit failed: " + depositCycle.failReason());
         }
@@ -958,6 +973,7 @@ public class AutoAmethystModule extends Module {
     public long reverts() { return reverts; }
     public long toolSwaps() { return toolSwaps; }
     public long deposits() { return deposits; }
+    public int shulkersStored() { return shulkersStored; }
     public int matureInBox() { return matureInBox; }
     public int reachableCount() { return reachable.size(); }
     public boolean pathfinderClamped() { return pathGuard.isApplied() && pathGuard.stillClamped(); }

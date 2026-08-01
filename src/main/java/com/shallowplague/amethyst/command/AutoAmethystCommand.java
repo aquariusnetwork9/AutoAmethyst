@@ -5,6 +5,8 @@ import com.shallowplague.amethyst.module.AutoAmethystModule;
 import com.shallowplague.amethyst.module.HarvestPolicy;
 import com.shallowplague.amethyst.module.MovementDriver;
 import com.zenith.feature.player.World;
+import com.zenith.mc.block.Block;
+import org.jspecify.annotations.Nullable;
 import com.zenith.Proxy;
 import com.zenith.command.api.Command;
 import com.zenith.command.api.CommandCategory;
@@ -219,14 +221,50 @@ public class AutoAmethystCommand extends Command {
                         .primaryColor();
                     return OK;
                 }))
+                .then(literal("chest").then(literal("here").executes(c -> {
+                    if (!connected()) {
+                        c.getSource().getEmbed().title("Not connected").errorColor();
+                        return ERROR;
+                    }
+                    // Stand next to the chest and look at it, or stand on it - we take the block the
+                    // bot is looking at if it is a container, otherwise the block it is standing on.
+                    final int[] target = findContainerNearby();
+                    if (target == null) {
+                        c.getSource().getEmbed()
+                            .title("No container found")
+                            .description("Stand next to the storage chest (within 4 blocks) and run this again.")
+                            .errorColor();
+                        return ERROR;
+                    }
+                    PLUGIN_CONFIG.deposit.chestX = target[0];
+                    PLUGIN_CONFIG.deposit.chestY = target[1];
+                    PLUGIN_CONFIG.deposit.chestZ = target[2];
+                    PLUGIN_CONFIG.deposit.chestSet = true;
+                    PLUGIN_CONFIG.deposit.haulToChest = true;
+                    module().requestReload();
+                    c.getSource().getEmbed()
+                        .title("Storage chest set")
+                        .description("Full shulkers will be carried here and left in it. "
+                            + "The chest is never broken.")
+                        .primaryColor();
+                    return OK;
+                })))
+                .then(literal("haul").then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.deposit.haulToChest = getToggle(c, "toggle");
+                    c.getSource().getEmbed()
+                        .title("Haul shulkers to chest " + toggleStrCaps(PLUGIN_CONFIG.deposit.haulToChest));
+                })))
                 .then(literal("status").executes(c -> {
                     c.getSource().getEmbed()
                         .title("Deposit")
                         .addField("Enabled", toggleStr(PLUGIN_CONFIG.deposit.enabled))
-                        .addField("Position", PLUGIN_CONFIG.deposit.posSet ? "set" : "not set")
+                        .addField("Shulker position", PLUGIN_CONFIG.deposit.posSet ? "set" : "not set")
+                        .addField("Storage chest", PLUGIN_CONFIG.deposit.chestSet ? "set" : "not set")
+                        .addField("Haul to chest", toggleStr(PLUGIN_CONFIG.deposit.haulToChest))
                         .addField("Trigger", "<= " + PLUGIN_CONFIG.deposit.triggerFreeSlots + " free slots")
                         .addField("Replace when full", toggleStr(PLUGIN_CONFIG.deposit.replaceWhenFull))
-                        .description("Position is intentionally not printed.")
+                        .addField("Shulkers stored", module().shulkersStored())
+                        .description("Positions are intentionally not printed.")
                         .primaryColor();
                 }))
                 .then(argument("toggle", toggle()).executes(c -> {
@@ -359,6 +397,42 @@ public class AutoAmethystCommand extends Command {
 
     private static boolean connected() {
         return Proxy.getInstance().isConnected();
+    }
+
+    /**
+     * Finds the nearest container block to the bot, so the user can set the storage chest by
+     * standing next to it rather than typing coordinates.
+     *
+     * <p>Returns {@code null} if nothing suitable is within reach.
+     */
+    private static int @Nullable [] findContainerNearby() {
+        final int px = MathHelper.floorI(CACHE.getPlayerCache().getX());
+        final int py = MathHelper.floorI(CACHE.getPlayerCache().getY());
+        final int pz = MathHelper.floorI(CACHE.getPlayerCache().getZ());
+        final int radius = 4;
+        int[] best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -radius; dy <= radius; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    final int x = px + dx, y = py + dy, z = pz + dz;
+                    if (!World.isChunkLoadedBlockPos(x, z)) continue;
+                    if (!isContainerBlock(World.getBlock(x, y, z))) continue;
+                    final double dist = (double) dx * dx + (double) dy * dy + (double) dz * dz;
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        best = new int[]{x, y, z};
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    private static boolean isContainerBlock(final Block block) {
+        if (HarvestPolicy.isShulkerBlock(block)) return true;
+        final String name = block.name();
+        return name.endsWith("chest") || name.equals("barrel");
     }
 
     private static String currentBlockPosString() {

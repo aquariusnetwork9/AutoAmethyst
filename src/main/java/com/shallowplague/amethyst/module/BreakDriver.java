@@ -10,6 +10,7 @@ import com.zenith.feature.player.raycast.BlockRaycastResult;
 import com.zenith.feature.player.raycast.RaycastHelper;
 import com.zenith.mc.block.Block;
 import com.zenith.mc.block.BlockPos;
+import com.zenith.mc.block.BlockRegistry;
 import org.cloudburstmc.math.vector.Vector2f;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
 
@@ -17,6 +18,7 @@ import java.util.function.Predicate;
 
 import static com.zenith.Globals.BOT;
 import static com.zenith.Globals.INPUTS;
+import static com.zenith.Globals.MODULE_LOG;
 
 /**
  * Breaks one block at a time through the vanilla interaction path, refusing anything the caller has
@@ -100,7 +102,19 @@ public final class BreakDriver {
             }
             return blocked("target vanished before the first swing");
         }
-        // THE guard. Everything this plugin is ever allowed to break passes through this line.
+        // ABSOLUTE VETO. Budding amethyst is never breakable, by anyone, under any configuration,
+        // in any mode. It is already absent from every allowlist, but this is the single line every
+        // break in the plugin passes through, so the rule is enforced here where no caller mistake,
+        // future refactor or config combination can route around it.
+        //
+        // It is worth being this heavy-handed about: budding amethyst drops nothing with any tool
+        // including Silk Touch, cannot be obtained in survival, and produces a cluster on each of
+        // six faces every ~2h17m. Breaking one is silent, instant and permanent.
+        if (block == BlockRegistry.BUDDING_AMETHYST) {
+            return vetoed("REFUSED to break budding amethyst - this should be unreachable, "
+                + "please report it");
+        }
+        // The configured allowlist. Everything else this plugin may break passes through here.
         if (!allowed.test(block)) return blocked("block is " + block.name() + ", which is not on the allowlist");
 
         if (++ticks > Math.max(20, maxTicks)) return blocked("no progress after " + ticks + " ticks (ghost block?)");
@@ -148,5 +162,15 @@ public final class BreakDriver {
         blockedReason = reason;
         active = false;
         return Status.BLOCKED;
+    }
+
+    /**
+     * A blocked break that also indicates a bug. Logged at error level rather than passed quietly
+     * back to the caller, because reaching it means an allowlist somewhere is wrong and the only
+     * reason nothing was destroyed is this backstop.
+     */
+    private Status vetoed(final String reason) {
+        MODULE_LOG.error("[BreakDriver] {}", reason);
+        return blocked(reason);
     }
 }

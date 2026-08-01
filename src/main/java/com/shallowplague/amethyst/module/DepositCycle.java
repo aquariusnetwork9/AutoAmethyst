@@ -18,6 +18,7 @@ import org.cloudburstmc.math.vector.Vector2f;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
+import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes;
 import org.jspecify.annotations.Nullable;
 
 import java.util.function.Predicate;
@@ -28,30 +29,41 @@ import static com.zenith.Globals.INPUTS;
 import static com.zenith.Globals.INVENTORY;
 
 /**
- * Empties the bot's harvest into a shulker box kept at a fixed spot, replacing the shulker when it
- * fills up.
+ * Empties the bot's harvest into a shulker box, swaps the shulker when it fills, hauls the full ones
+ * to a storage chest, and walks back to the geode.
  *
- * <p>The cycle: open the shulker, move stacks in, and when it will not take any more, close it,
- * break it (a shulker keeps its contents when broken), pick the full one up, and place a fresh
- * empty one from the inventory. Full shulkers accumulate in the bot's inventory for you to collect.
+ * <p>The full run:
+ * <ol>
+ *   <li>walk to the deposit shulker, open it, move the harvest in</li>
+ *   <li>when it will not take any more: close, break it (a shulker keeps its contents), pick it up,
+ *       place a fresh empty one, carry on</li>
+ *   <li>when the inventory has nothing left to deposit: haul every full shulker to the storage
+ *       chest and leave them there</li>
+ *   <li>walk back to the stand position the harvest loop was using</li>
+ * </ol>
+ *
+ * <p>That last step is not cosmetic. Without it the bot finishes a deposit standing at the chest,
+ * re-anchors there, and in stationary mode simply never returns to the geode - the farm looks alive
+ * and produces nothing.
  *
  * <h2>Transfers use ClickItem, not ShiftClick</h2>
  * Stock Zenith's {@code ShiftClick} sends an <b>empty</b> {@code changedSlots} map - its own source
  * comment flags this as a likely anticheat problem. On a server that validates click packets it is
  * rejected, and the failure is silent: the transfer simply never happens. So every move here is a
- * pair of {@link ClickItem} clicks, pick the stack up then put it down. Twice the packets, but they
- * carry correct predicted state and actually work.
+ * pair of {@link ClickItem} clicks, pick the stack up then put it down.
  *
- * <h2>Placement safety</h2>
- * Placing a block on a face of a budding amethyst permanently blocks growth on that face. The
- * deposit spot is validated through {@link HarvestPolicy#isSafeToPlaceAt} before every placement,
- * not just at configuration time.
+ * <h2>What it will not do</h2>
+ * The storage chest is never broken. The only blocks this plugin can break are harvest targets and
+ * shulker boxes, and the chest is neither - if the chest position holds something unexpected the run
+ * fails with a reason rather than clearing it. Placement is validated through
+ * {@link HarvestPolicy#isSafeToPlaceAt} every time, so a shulker can never end up on a budding
+ * amethyst growth face.
  */
 public final class DepositCycle {
 
     public enum Status { BUSY, DONE, FAILED }
 
-    /** Ticks between path requests while approaching, so async calculation is not re-triggered. */
+    /** Ticks between path requests, so async path calculation is not re-triggered every tick. */
     private static final int REPATH_COOLDOWN_TICKS = 40;
 
     /** How many times a window that closes mid-transfer will be re-opened before giving up. */
@@ -67,7 +79,12 @@ public final class DepositCycle {
         CLOSE_FULL,
         BREAK_SHULKER,
         COLLECT_SHULKER,
-        CLOSE_DONE
+        CLOSE_DONE,
+        CHEST_APPROACH,
+        CHEST_OPEN,
+        CHEST_TRANSFER,
+        CHEST_CLOSE,
+        RETURN
     }
 
     private final Object owner;
@@ -80,11 +97,16 @@ public final class DepositCycle {
     private int phaseTicks = 0;
     private int actionCooldown = 0;
     private int stallCount = 0;
-    private int lastPlayerYieldCount = -1;
+    private int lastTransferCount = -1;
     private int placeAttempts = 0;
     private int repathCooldown = 0;
     private int reopens = 0;
+    private int shulkersStored = 0;
+    private int fullShulkersBeforeChest = 0;
     private String failReason = "";
+
+    /** Where the harvest loop was standing, so the run can put the bot back afterwards. */
+    private int returnX, returnY, returnZ;
 
     public DepositCycle(final Object owner) {
         this.owner = owner;
@@ -94,9 +116,14 @@ public final class DepositCycle {
     public String failReason() { return failReason; }
     public boolean isRunning() { return phase != Phase.IDLE; }
     public String phaseName() { return phase.name(); }
+    public int shulkersStored() { return shulkersStored; }
 
-    public void begin() {
+    /** @param returnTo the stand position to walk back to when the run finishes */
+    public void begin(final int returnToX, final int returnToY, final int returnToZ) {
         reset();
+        this.returnX = returnToX;
+        this.returnY = returnToY;
+        this.returnZ = returnToZ;
         phase = Phase.APPROACH;
     }
 
@@ -105,7 +132,7 @@ public final class DepositCycle {
         phaseTicks = 0;
         actionCooldown = 0;
         stallCount = 0;
-        lastPlayerYieldCount = -1;
+        lastTransferCount = -1;
         placeAttempts = 0;
         repathCooldown = 0;
         reopens = 0;
@@ -114,13 +141,6 @@ public final class DepositCycle {
         shulkerCollector.reset();
     }
 
-    /**
-     * Drives one tick.
-     *
-     * @param yield   which items should be moved into the shulker
-     * @param cfg     deposit configuration, including the shulker position
-     * @param reach   effective block reach
-     */
     public Status tick(final Predicate<ItemStack> yield, final AutoAmethystConfig.Deposit cfg,
                        final double reach, final boolean requireLineOfSight, final int priority) {
         if (phase == Phase.IDLE) return Status.DONE;
@@ -133,47 +153,172 @@ public final class DepositCycle {
         }
 
         return switch (phase) {
-            case APPROACH -> tickApproach(cfg, reach);
+            case APPROACH -> approach(cfg.x, cfg.y, cfg.z, cfg, reach, Phase.ENSURE_CONTAINER);
             case ENSURE_CONTAINER -> tickEnsureContainer(cfg);
             case PLACE_SHULKER -> tickPlaceShulker(cfg);
-            case OPEN -> tickOpen(cfg, reach, requireLineOfSight, priority);
-            case TRANSFER -> tickTransfer(yield, cfg);
-            case CLOSE_FULL -> tickClose(Phase.BREAK_SHULKER);
+            case OPEN -> open(cfg.x, cfg.y, cfg.z, cfg, reach, requireLineOfSight, priority, Phase.TRANSFER);
+            case TRANSFER -> transfer(yield, cfg, Phase.CLOSE_DONE, true);
+            case CLOSE_FULL -> close(Phase.BREAK_SHULKER);
             case BREAK_SHULKER -> tickBreakShulker(cfg, reach, requireLineOfSight, priority);
             case COLLECT_SHULKER -> tickCollectShulker(cfg, priority);
-            case CLOSE_DONE -> tickClose(Phase.IDLE);
+            case CLOSE_DONE -> close(needsChestTrip(cfg) ? Phase.CHEST_APPROACH : Phase.RETURN);
+            case CHEST_APPROACH -> approach(cfg.chestX, cfg.chestY, cfg.chestZ, cfg, reach, Phase.CHEST_OPEN);
+            case CHEST_OPEN -> open(cfg.chestX, cfg.chestY, cfg.chestZ, cfg, reach, requireLineOfSight,
+                                    priority, Phase.CHEST_TRANSFER);
+            case CHEST_TRANSFER -> transfer(DepositCycle::isFullShulkerItem, cfg, Phase.CHEST_CLOSE, false);
+            case CHEST_CLOSE -> close(Phase.RETURN);
+            case RETURN -> tickReturn(cfg, reach);
             case IDLE -> Status.DONE;
         };
     }
 
-    // ------------------------------------------------------------------ phases
+    // ------------------------------------------------------------------ shared movement / window
 
-    private Status tickApproach(final AutoAmethystConfig.Deposit cfg, final double reach) {
-        final Position centre = World.blockInteractionCenter(cfg.x, cfg.y, cfg.z);
+    /**
+     * Walks to within reach of a block, then moves to {@code next}.
+     *
+     * <p>Safe to use the pathfinder here: {@link PathfinderGuard} has already clamped
+     * {@code allowBreak} and {@code allowPlace} off, so it can only walk, never mine or bridge a
+     * route. The repath cooldown matters because path calculation is asynchronous - re-issuing
+     * every tick while {@code isActive()} still reads false produces a storm of instantly-satisfied
+     * requests and the bot never actually goes anywhere.
+     */
+    private Status approach(final int x, final int y, final int z, final AutoAmethystConfig.Deposit cfg,
+                            final double reach, final Phase next) {
+        final Position centre = World.blockInteractionCenter(x, y, z);
         final double dist = distanceToEye(centre.x(), centre.y(), centre.z());
         if (dist <= reach - 0.5) {
             if (BARITONE.isActive()) BARITONE.stop();
-            advance(Phase.ENSURE_CONTAINER);
+            advance(next);
             return Status.BUSY;
         }
         if (dist > cfg.maxTravelDistance) {
-            return fail("deposit position is " + (int) dist + " blocks away, over the "
-                + cfg.maxTravelDistance + " limit");
+            return fail("target is " + (int) dist + " blocks away, over the "
+                + (int) cfg.maxTravelDistance + " limit");
         }
-        // Safe to use the pathfinder here: PathfinderGuard has already clamped allowBreak and
-        // allowPlace off, so it can only walk, never mine or bridge its way over.
-        //
-        // The cooldown matters. Path calculation is asynchronous, so isActive() reads false for a
-        // moment after the request; re-issuing every tick during that window produces a storm of
-        // instantly-satisfied path requests and the bot never actually goes anywhere.
         if (repathCooldown > 0) {
             repathCooldown--;
         } else if (!BARITONE.isActive()) {
-            BARITONE.pathTo(cfg.x, cfg.y + 1, cfg.z);
+            BARITONE.pathTo(x, y + 1, z);
             repathCooldown = REPATH_COOLDOWN_TICKS;
         }
         return Status.BUSY;
     }
+
+    private Status open(final int x, final int y, final int z, final AutoAmethystConfig.Deposit cfg,
+                        final double reach, final boolean requireLineOfSight, final int priority,
+                        final Phase next) {
+        if (openContainerId() != 0) {
+            lastTransferCount = -1;
+            stallCount = 0;
+            advance(next);
+            return Status.BUSY;
+        }
+        final Position centre = World.blockInteractionCenter(x, y, z);
+        final Vector2f rot = RotationHelper.rotationTo(centre.x(), centre.y(), centre.z());
+        if (!BreakDriver.canEngage(x, y, z, rot, reach, requireLineOfSight)) {
+            return fail("cannot see the container from here");
+        }
+        INPUTS.submit(InputRequest.builder()
+            .owner(owner)
+            .input(Input.builder()
+                .hand(Hand.MAIN_HAND)
+                .clickRequiresRotation(true)
+                .clickTarget(new ClickTarget.BlockPosition(x, y, z))
+                .rightClick(true)
+                .build())
+            .yaw(rot.getX())
+            .pitch(rot.getY())
+            .priority(priority)
+            .build());
+        actionCooldown = Math.max(1, cfg.stepSettleTicks);
+        return Status.BUSY;
+    }
+
+    /**
+     * Moves one stack per step from the player half into the container half: left click to pick up,
+     * left click a destination to put down. Paced by {@code stepSettleTicks} - an unthrottled stream
+     * of container clicks is itself something servers close windows over.
+     *
+     * @param allowReplace whether a full container should trigger the break-and-replace path. False
+     *                     for the storage chest, which we neither break nor replace.
+     */
+    private Status transfer(final Predicate<ItemStack> what, final AutoAmethystConfig.Deposit cfg,
+                            final Phase onDone, final boolean allowReplace) {
+        final Container container = CACHE.getPlayerCache().getInventoryCache().getOpenContainer();
+        if (container.getContainerId() == 0) {
+            // A laggy server will close the window out from under a deposit mid-transfer. Treating
+            // that as fatal strands a half-emptied inventory and pauses the farm for something that
+            // just needs the window opening again, so re-open a bounded number of times.
+            if (++reopens > MAX_REOPENS) {
+                return fail("the container window kept closing mid-transfer (" + (reopens - 1) + " re-opens)");
+            }
+            advance(allowReplace ? Phase.OPEN : Phase.CHEST_OPEN);
+            return Status.BUSY;
+        }
+
+        // If the mouse is holding something, put it down before doing anything else.
+        final ItemStack mouse = CACHE.getPlayerCache().getInventoryCache().getMouseStack();
+        if (mouse != Container.EMPTY_STACK) {
+            final int dest = findDestinationSlot(container, mouse);
+            if (dest < 0) {
+                final int back = findFreePlayerSlot(container);
+                if (back < 0) return fail("inventory and container are both full with an item in hand");
+                click(container.getContainerId(), back, cfg);
+                return Status.BUSY;
+            }
+            click(container.getContainerId(), dest, cfg);
+            return Status.BUSY;
+        }
+
+        final int playerStart = container.getSize() - 36;
+        final int source = findPlayerSlotMatching(container, playerStart, what);
+        if (source < 0) {
+            advance(onDone);
+            return Status.BUSY;
+        }
+        final int dest = findDestinationSlot(container, container.getItemStack(source));
+        if (dest < 0) {
+            if (!allowReplace) {
+                return fail("the storage chest is full - empty it and resume");
+            }
+            if (!cfg.replaceWhenFull) {
+                return fail("deposit shulker is full and replaceWhenFull is off");
+            }
+            advance(Phase.CLOSE_FULL);
+            return Status.BUSY;
+        }
+
+        // Stall detection: if the count of movable items in the player half stops falling, the
+        // server is rejecting our clicks and retrying forever would just spam it.
+        final int remaining = countPlayerMatching(container, playerStart, what);
+        if (lastTransferCount >= 0 && remaining >= lastTransferCount) {
+            if (++stallCount > Math.max(3, cfg.maxStalledSteps)) {
+                return fail("container transfers are not taking effect (server rejecting clicks?)");
+            }
+        } else {
+            stallCount = 0;
+        }
+        lastTransferCount = remaining;
+
+        click(container.getContainerId(), source, cfg);
+        return Status.BUSY;
+    }
+
+    private Status close(final Phase next) {
+        if (openContainerId() != 0) {
+            INVENTORY.submit(InventoryActionRequest.builder()
+                .owner(owner)
+                .actions(new CloseContainer())
+                .priority(0)
+                .build());
+            return Status.BUSY;
+        }
+        advance(next);
+        return Status.BUSY;
+    }
+
+    // ------------------------------------------------------------------ shulker phases
 
     private Status tickEnsureContainer(final AutoAmethystConfig.Deposit cfg) {
         final Block at = World.getBlock(cfg.x, cfg.y, cfg.z);
@@ -216,118 +361,7 @@ public final class DepositCycle {
         if (data == null) return fail("could not resolve the shulker item");
         BARITONE.placeBlock(cfg.x, cfg.y, cfg.z, data);
         actionCooldown = Math.max(1, cfg.stepSettleTicks);
-        // re-check next pass; ENSURE_CONTAINER will move us on once the block actually exists
         advance(Phase.ENSURE_CONTAINER);
-        return Status.BUSY;
-    }
-
-    private Status tickOpen(final AutoAmethystConfig.Deposit cfg, final double reach,
-                            final boolean requireLineOfSight, final int priority) {
-        if (openContainerId() != 0) {
-            lastPlayerYieldCount = -1;
-            stallCount = 0;
-            advance(Phase.TRANSFER);
-            return Status.BUSY;
-        }
-        final Position centre = World.blockInteractionCenter(cfg.x, cfg.y, cfg.z);
-        final Vector2f rot = RotationHelper.rotationTo(centre.x(), centre.y(), centre.z());
-        if (!BreakDriver.canEngage(cfg.x, cfg.y, cfg.z, rot, reach, requireLineOfSight)) {
-            return fail("cannot see the deposit shulker from here");
-        }
-        INPUTS.submit(InputRequest.builder()
-            .owner(owner)
-            .input(Input.builder()
-                .hand(Hand.MAIN_HAND)
-                .clickRequiresRotation(true)
-                .clickTarget(new ClickTarget.BlockPosition(cfg.x, cfg.y, cfg.z))
-                .rightClick(true)
-                .build())
-            .yaw(rot.getX())
-            .pitch(rot.getY())
-            .priority(priority)
-            .build());
-        actionCooldown = Math.max(1, cfg.stepSettleTicks);
-        return Status.BUSY;
-    }
-
-    /**
-     * Moves one stack per step: left click the source slot to pick it up, left click a free
-     * destination slot to put it down. Paced by {@code stepSettleTicks} - an unthrottled stream of
-     * container clicks is itself something servers close windows over.
-     */
-    private Status tickTransfer(final Predicate<ItemStack> yield, final AutoAmethystConfig.Deposit cfg) {
-        final Container container = CACHE.getPlayerCache().getInventoryCache().getOpenContainer();
-        if (container.getContainerId() == 0) {
-            // A laggy server will close the window out from under a deposit mid-transfer. Treating
-            // that as fatal strands a half-emptied inventory and pauses the farm for something that
-            // just needs the window opening again, so re-open a bounded number of times.
-            if (++reopens > MAX_REOPENS) {
-                return fail("the shulker window kept closing mid-transfer (" + (reopens - 1) + " re-opens)");
-            }
-            advance(Phase.OPEN);
-            return Status.BUSY;
-        }
-
-        // If the mouse is holding something, put it down before doing anything else.
-        final ItemStack mouse = CACHE.getPlayerCache().getInventoryCache().getMouseStack();
-        if (mouse != Container.EMPTY_STACK) {
-            final int free = findDestinationSlot(container, mouse);
-            if (free < 0) {
-                // nowhere to put it in the shulker; give it back to the player inventory
-                final int back = findFreePlayerSlot(container);
-                if (back < 0) return fail("inventory and shulker are both full with an item in hand");
-                click(container.getContainerId(), back, cfg);
-                return Status.BUSY;
-            }
-            click(container.getContainerId(), free, cfg);
-            return Status.BUSY;
-        }
-
-        final int playerStart = container.getSize() - 36;
-        final int source = findPlayerSlotMatching(container, playerStart, yield);
-        if (source < 0) {
-            advance(Phase.CLOSE_DONE);
-            return Status.BUSY;
-        }
-        final int free = findDestinationSlot(container, container.getItemStack(source));
-        if (free < 0) {
-            if (!cfg.replaceWhenFull) {
-                return fail("deposit shulker is full and replaceWhenFull is off");
-            }
-            advance(Phase.CLOSE_FULL);
-            return Status.BUSY;
-        }
-
-        // Stall detection: if the count of depositable items in the player half stops falling, the
-        // server is rejecting our clicks and retrying forever would just spam it.
-        final int remaining = countPlayerYield(container, playerStart, yield);
-        if (lastPlayerYieldCount >= 0 && remaining >= lastPlayerYieldCount) {
-            if (++stallCount > Math.max(3, cfg.maxStalledSteps)) {
-                return fail("container transfers are not taking effect (server rejecting clicks?)");
-            }
-        } else {
-            stallCount = 0;
-        }
-        lastPlayerYieldCount = remaining;
-
-        click(container.getContainerId(), source, cfg);
-        return Status.BUSY;
-    }
-
-    private Status tickClose(final Phase next) {
-        if (openContainerId() != 0) {
-            INVENTORY.submit(InventoryActionRequest.builder()
-                .owner(owner)
-                .actions(new CloseContainer())
-                .priority(0)
-                .build());
-            return Status.BUSY;
-        }
-        if (next == Phase.IDLE) {
-            phase = Phase.IDLE;
-            return Status.DONE;
-        }
-        advance(next);
         return Status.BUSY;
     }
 
@@ -363,9 +397,6 @@ public final class DepositCycle {
     }
 
     private Status tickCollectShulker(final AutoAmethystConfig.Deposit cfg, final int priority) {
-        final double ax = CACHE.getPlayerCache().getX();
-        final double ay = CACHE.getPlayerCache().getY();
-        final double az = CACHE.getPlayerCache().getZ();
         collectCfg.maxDistance = Math.max(2.0, cfg.collectRadius);
         collectCfg.chaseTimeoutTicks = cfg.collectTimeoutTicks;
 
@@ -384,6 +415,36 @@ public final class DepositCycle {
             case FAILED -> fail("could not collect the broken shulker: " + shulkerCollector.failReason());
             case IDLE -> Status.BUSY;
         };
+    }
+
+    // ------------------------------------------------------------------ chest trip / return
+
+    /** Whether there are full shulkers to haul and somewhere configured to put them. */
+    private boolean needsChestTrip(final AutoAmethystConfig.Deposit cfg) {
+        if (!cfg.haulToChest || !cfg.chestSet) return false;
+        return countFullShulkers() > 0;
+    }
+
+    private Status tickReturn(final AutoAmethystConfig.Deposit cfg, final double reach) {
+        // Nothing configured to return to, or already close enough.
+        final double dist = distanceToEye(returnX + 0.5, returnY + 0.5, returnZ + 0.5);
+        if (dist <= Math.max(1.5, cfg.returnTolerance)) {
+            if (BARITONE.isActive()) BARITONE.stop();
+            phase = Phase.IDLE;
+            return Status.DONE;
+        }
+        if (dist > cfg.maxTravelDistance) {
+            // Do not strand the bot walking somewhere absurd; the harvest loop re-anchors instead.
+            phase = Phase.IDLE;
+            return Status.DONE;
+        }
+        if (repathCooldown > 0) {
+            repathCooldown--;
+        } else if (!BARITONE.isActive()) {
+            BARITONE.pathTo(returnX, returnY, returnZ);
+            repathCooldown = REPATH_COOLDOWN_TICKS;
+        }
+        return Status.BUSY;
     }
 
     // ------------------------------------------------------------------ helpers
@@ -422,10 +483,13 @@ public final class DepositCycle {
         if (moving != null && moving != Container.EMPTY_STACK) {
             final ItemData data = ItemRegistry.REGISTRY.get(moving.getId());
             final int maxStack = data == null ? 64 : data.stackSize();
-            for (int i = 0; i < playerStart; i++) {
-                final ItemStack slot = container.getItemStack(i);
-                if (slot == Container.EMPTY_STACK) continue;
-                if (slot.getId() == moving.getId() && slot.getAmount() < maxStack) return i;
+            // Shulker boxes never stack, so only ever look for an empty slot for one of those.
+            if (maxStack > 1) {
+                for (int i = 0; i < playerStart; i++) {
+                    final ItemStack slot = container.getItemStack(i);
+                    if (slot == Container.EMPTY_STACK) continue;
+                    if (slot.getId() == moving.getId() && slot.getAmount() < maxStack) return i;
+                }
             }
         }
         for (int i = 0; i < playerStart; i++) {
@@ -443,22 +507,22 @@ public final class DepositCycle {
     }
 
     private static int findPlayerSlotMatching(final Container container, final int playerStart,
-                                              final Predicate<ItemStack> yield) {
+                                              final Predicate<ItemStack> what) {
         for (int i = playerStart; i < container.getSize(); i++) {
             final ItemStack stack = container.getItemStack(i);
             if (stack == Container.EMPTY_STACK) continue;
-            if (yield.test(stack)) return i;
+            if (what.test(stack)) return i;
         }
         return -1;
     }
 
-    private static int countPlayerYield(final Container container, final int playerStart,
-                                        final Predicate<ItemStack> yield) {
+    private static int countPlayerMatching(final Container container, final int playerStart,
+                                           final Predicate<ItemStack> what) {
         int total = 0;
         for (int i = playerStart; i < container.getSize(); i++) {
             final ItemStack stack = container.getItemStack(i);
             if (stack == Container.EMPTY_STACK) continue;
-            if (yield.test(stack)) total += stack.getAmount();
+            if (what.test(stack)) total += stack.getAmount();
         }
         return total;
     }
@@ -474,9 +538,26 @@ public final class DepositCycle {
         return -1;
     }
 
+    private static int countFullShulkers() {
+        final var inv = CACHE.getPlayerCache().getPlayerInventory();
+        int count = 0;
+        for (int slot = 9; slot <= 44; slot++) {
+            if (isFullShulkerItem(inv.get(slot))) count++;
+        }
+        return count;
+    }
+
+    /**
+     * A shulker with something in it. Emptiness is read from the CONTAINER data component, which
+     * 2b2t does transmit for shulker items.
+     */
+    public static boolean isFullShulkerItem(final @Nullable ItemStack stack) {
+        if (!HarvestPolicy.isShulkerItem(stack)) return false;
+        return !shulkerIsEmpty(stack);
+    }
+
     private static boolean shulkerIsEmpty(final ItemStack stack) {
-        final var contents = stack.getDataComponentsOrEmpty()
-            .get(org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes.CONTAINER);
+        final var contents = stack.getDataComponentsOrEmpty().get(DataComponentTypes.CONTAINER);
         return contents == null || contents.isEmpty();
     }
 
@@ -488,6 +569,12 @@ public final class DepositCycle {
     }
 
     private void advance(final Phase next) {
+        // Count what actually left the inventory, not what we hoped to move.
+        if (next == Phase.CHEST_TRANSFER) {
+            fullShulkersBeforeChest = countFullShulkers();
+        } else if (phase == Phase.CHEST_TRANSFER) {
+            shulkersStored += Math.max(0, fullShulkersBeforeChest - countFullShulkers());
+        }
         phase = next;
         phaseTicks = 0;
     }

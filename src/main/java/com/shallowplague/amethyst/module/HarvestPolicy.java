@@ -68,6 +68,10 @@ public final class HarvestPolicy {
      */
     public static boolean isHarvestTarget(final Block block, final Mode mode,
                                           final AutoAmethystConfig.Harvest cfg) {
+        // Never, in any mode, under any configuration. Repeated here as well as in isBreakable and
+        // BreakDriver because this is the method the scanner uses to choose targets, and the
+        // cheapest place to be certain is all three.
+        if (block == BlockRegistry.BUDDING_AMETHYST) return false;
         if (block == BlockRegistry.AMETHYST_CLUSTER) {
             return mode == Mode.SHARDS || cfg.silkHarvestCluster;
         }
@@ -130,6 +134,11 @@ public final class HarvestPolicy {
      */
     public static boolean isBreakable(final Block block, final Mode mode,
                                       final AutoAmethystConfig.Harvest cfg) {
+        // Stated explicitly rather than left to fall out of the allowlist below. Budding amethyst
+        // is never breakable, and this rule should survive someone later adding a stage toggle or
+        // widening the harvest set without thinking about it. BreakDriver enforces the same veto
+        // again at the point of the click.
+        if (block == BlockRegistry.BUDDING_AMETHYST) return false;
         return isHarvestTarget(block, mode, cfg) || isShulkerBlock(block);
     }
 
