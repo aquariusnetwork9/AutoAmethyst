@@ -62,6 +62,12 @@ public final class MovementDriver {
         return phase != Phase.NONE;
     }
 
+    /** Phase and progress, for the diagnosis report. Carries no world coordinates. */
+    public String describe() {
+        if (phase == Phase.NONE) return "idle";
+        return phase + " legTicks=" + legTicks + " stuck=" + stuckCounter;
+    }
+
     /** Parses a config mode string, falling back to STATIONARY on anything unrecognised. */
     public static Mode parseMode(final String raw) {
         if (raw == null) return Mode.STATIONARY;
@@ -169,7 +175,7 @@ public final class MovementDriver {
             resetLegProgress();
             return Status.BUSY;
         }
-        walkToward(cfg.columnX, cfg.columnZ, cfg.sneakWhileWalking, priority);
+        walkToward(cfg.columnX, cfg.columnZ, cfg, priority);
         return Status.BUSY;
     }
 
@@ -195,7 +201,7 @@ public final class MovementDriver {
 
     private Status tickWalkToTarget(final AutoAmethystConfig.Movement cfg, final int priority) {
         if (atTarget(cfg.arriveRadius)) return arrive();
-        walkToward(targetX, targetZ, cfg.sneakWhileWalking, priority);
+        walkToward(targetX, targetZ, cfg, priority);
         return Status.BUSY;
     }
 
@@ -228,9 +234,25 @@ public final class MovementDriver {
      * the stand position and oscillating around it until the leg times out. Growth takes hours per
      * cluster, so nothing here is in a hurry.
      */
-    private void walkToward(final int x, final int z, final boolean sneak, final int priority) {
+    /**
+     * Walks toward an XZ target.
+     *
+     * <p>Sprints unless sneaking is asked for; the two are mutually exclusive anyway, since Zenith
+     * cancels sprint whenever sneak or back is held ({@code Input#apply}). Jumps once the leg stops
+     * making progress, which is how the bot gets up a full block step - the 0.6 auto-step handles
+     * slabs and stairs but not a whole block.
+     */
+    private void walkToward(final int x, final int z, final AutoAmethystConfig.Movement cfg,
+                            final int priority) {
         final float yaw = RotationHelper.yawToXZ(x + 0.5, z + 0.5);
-        submit(Input.builder().pressingForward(true).sneaking(sneak).build(), priority, yaw);
+        final boolean sneak = cfg.sneakWhileWalking;
+        final boolean jump = cfg.jumpWhenStuck && stuckCounter >= Math.max(1, cfg.jumpAfterStuckTicks);
+        submit(Input.builder()
+            .pressingForward(true)
+            .sneaking(sneak)
+            .sprinting(cfg.sprint && !sneak)
+            .jumping(jump)
+            .build(), priority, yaw);
     }
 
     private void submit(final Input input, final int priority, final @Nullable Float yaw) {

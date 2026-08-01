@@ -115,6 +115,21 @@ public class AutoAmethystModule extends Module {
     private int shulkersStored = 0;
     private int matureInBox = 0;
     private long sessionStartMs = 0;
+
+    // --- diagnosis: why is nothing happening? ---
+    /** Harvestable blocks found in the local scan cube, before any filter. */
+    private int diagFoundInCube = 0;
+    /** Rejected because the interaction box centre was beyond reach. */
+    private int diagRejectedFar = 0;
+    /** Rejected because the position is on the skip cooldown. */
+    private int diagRejectedSkipped = 0;
+    /** Rejected by canEngage: out of reach at that rotation, or no line of sight. */
+    private int diagRejectedNoLos = 0;
+    /** Distance from the eye to the nearest harvestable block anywhere in the box. */
+    private double diagNearestDist = -1;
+    /** Box-relative offset of that nearest block, so logs carry no real coordinates. */
+    private int diagNearestDx, diagNearestDy, diagNearestDz;
+    private long lastWaypointStartTick = 0;
     private int yieldAtStart = -1;
     private int yieldNow = -1;
     private int yieldBeforeDeposit = 0;
@@ -137,7 +152,7 @@ public class AutoAmethystModule extends Module {
     @Override
     public void onEnable() {
         // Do this first. Everything else assumes the pathfinder cannot mine or build.
-        pathGuard.apply();
+        pathGuard.apply(PLUGIN_CONFIG.movement.sprint);
         resetRuntime();
         sessionStartMs = System.currentTimeMillis();
         yieldAtStart = -1;
@@ -239,7 +254,7 @@ public class AutoAmethystModule extends Module {
         // The clamp is the only thing standing between the pathfinder and the budding blocks. If
         // something else has written those settings while we were running, stop rather than mine.
         if (!pathGuard.stillClamped()) {
-            pathGuard.apply();
+            pathGuard.apply(PLUGIN_CONFIG.movement.sprint);
             if (!pathGuard.stillClamped()) {
                 pause("pathfinder allowBreak/allowPlace could not be clamped off");
                 return;
@@ -269,6 +284,17 @@ public class AutoAmethystModule extends Module {
         }
 
         maybeLogSummary();
+        maybeLogDebug();
+    }
+
+    /** Periodic "what am I doing and why" dump, on when {@code stats.debug} is set. */
+    private void maybeLogDebug() {
+        if (!PLUGIN_CONFIG.stats.debug) return;
+        final int interval = Math.max(20, PLUGIN_CONFIG.stats.debugIntervalTicks);
+        if (tickCounter % interval != 0) return;
+        for (final String line : diagnose()) {
+            info("[debug] {}", line);
+        }
     }
 
     /** One time sanity checks that would otherwise produce silent nonsense. */
@@ -339,6 +365,12 @@ public class AutoAmethystModule extends Module {
         dwellTicks = 0;
         final long pos = pickNearestTarget();
         if (pos == Long.MIN_VALUE) {
+            // Every candidate was rejected. This used to clear the list silently, which made the
+            // status read "in reach: 0" with "skipped: 0" and gave no hint that anything had been
+            // considered at all - a line-of-sight problem was indistinguishable from an empty geode.
+            if (diagRejectedNoLos > 0) {
+                debug("Rejected all {} in-reach targets: no line of sight from here", diagRejectedNoLos);
+            }
             reachable.clear();
             return;
         }
@@ -393,7 +425,8 @@ public class AutoAmethystModule extends Module {
     private void tickReturning() {
         final DropCollector.Status status = collector.tickReturn(
             anchorX, anchorZ, PLUGIN_CONFIG.collection.returnTolerance,
-            PLUGIN_CONFIG.collection.sneakWhileCollecting, harvest().inputPriority,
+            PLUGIN_CONFIG.collection.sneakWhileCollecting,
+            PLUGIN_CONFIG.collection.sprintWhileCollecting, harvest().inputPriority,
             PLUGIN_CONFIG.collection.stuckTicks);
         switch (status) {
             case RETURNING, CHASING, IDLE -> { }
@@ -508,14 +541,18 @@ public class AutoAmethystModule extends Module {
         final int loY = Math.max(h.minY, py - r), hiY = Math.min(h.maxY, py + r);
         final int loZ = Math.max(h.minZ, pz - r), hiZ = Math.min(h.maxZ, pz + r);
 
+        diagFoundInCube = 0;
+        diagRejectedFar = 0;
+        diagRejectedSkipped = 0;
         for (int x = loX; x <= hiX; x++) {
             for (int z = loZ; z <= hiZ; z++) {
                 if (!World.isChunkLoadedBlockPos(x, z)) continue;
                 for (int y = loY; y <= hiY; y++) {
                     if (!isHarvestable(World.getBlock(x, y, z))) continue;
+                    diagFoundInCube++;
                     final long pos = BlockPos.asLong(x, y, z);
-                    if (isSkipped(pos)) continue;
-                    if (!withinReach(x, y, z, reach)) continue;
+                    if (isSkipped(pos)) { diagRejectedSkipped++; continue; }
+                    if (!withinReach(x, y, z, reach)) { diagRejectedFar++; continue; }
                     reachable.add(pos);
                 }
             }
@@ -530,15 +567,79 @@ public class AutoAmethystModule extends Module {
     private void recountBox() {
         final AutoAmethystConfig.Harvest h = harvest();
         int count = 0;
+        double nearestSq = Double.MAX_VALUE;
+        int nx = 0, ny = 0, nz = 0;
+        final double ex = BOT.getX(), ey = BOT.getEyeY(), ez = BOT.getZ();
         for (int x = h.minX; x <= h.maxX; x++) {
             for (int z = h.minZ; z <= h.maxZ; z++) {
                 if (!World.isChunkLoadedBlockPos(x, z)) continue;
                 for (int y = h.minY; y <= h.maxY; y++) {
-                    if (isHarvestable(World.getBlock(x, y, z))) count++;
+                    if (!isHarvestable(World.getBlock(x, y, z))) continue;
+                    count++;
+                    // Tracked so "nothing in reach" can say how far away the nearest one actually
+                    // is, which is the difference between "wrong waypoints" and "empty geode".
+                    final double d = MathHelper.distanceSq3d(x + 0.5, y + 0.5, z + 0.5, ex, ey, ez);
+                    if (d < nearestSq) {
+                        nearestSq = d;
+                        nx = x; ny = y; nz = z;
+                    }
                 }
             }
         }
         matureInBox = count;
+        if (count > 0) {
+            diagNearestDist = Math.sqrt(nearestSq);
+            diagNearestDx = nx - h.minX;
+            diagNearestDy = ny - h.minY;
+            diagNearestDz = nz - h.minZ;
+        } else {
+            diagNearestDist = -1;
+        }
+    }
+
+    /**
+     * A human readable answer to "why is the bot standing there doing nothing".
+     *
+     * <p>Deliberately reports box-relative offsets rather than world coordinates, so the output is
+     * safe to paste anywhere.
+     */
+    public List<String> diagnose() {
+        final List<String> out = new java.util.ArrayList<>();
+        out.add("state=" + stateName() + " mode=" + mode() + " movement=" + movementMode());
+        if (paused) out.add("PAUSED: " + pauseReason);
+        out.add("mature in box=" + matureInBox
+            + "  found in scan cube=" + diagFoundInCube
+            + "  in reach=" + reachable.size());
+        out.add("rejected: too far=" + diagRejectedFar
+            + "  on cooldown=" + diagRejectedSkipped
+            + "  no line of sight=" + diagRejectedNoLos);
+        if (diagNearestDist >= 0) {
+            out.add(String.format("nearest harvestable is %.2f blocks away at box+[%d, %d, %d] (reach is %.2f)",
+                diagNearestDist, diagNearestDx, diagNearestDy, diagNearestDz, effectiveReach()));
+            if (diagNearestDist > effectiveReach() && reachable.isEmpty()) {
+                out.add("=> nothing is within reach of this stand position; the bot should be moving."
+                    + " Check the waypoints actually put it next to the clusters.");
+            }
+        } else {
+            out.add("no harvestable blocks anywhere in the box (is the box right? is the chunk loaded?)");
+        }
+        if (diagRejectedNoLos > 0 && reachable.isEmpty()) {
+            out.add("=> everything in reach was rejected for line of sight."
+                + " If the clusters are plainly visible, try 'autoamethyst los off'.");
+        }
+        out.add("movement: " + mover.describe()
+            + "  waypoint=" + (waypointIndex + 1) + "/" + PLUGIN_CONFIG.movement.waypoints.size()
+            + "  dwell=" + dwellTicks + "/" + PLUGIN_CONFIG.movement.dwellTicks
+            + "  ticks since leg start=" + (tickCounter - lastWaypointStartTick));
+        out.add("collection=" + (PLUGIN_CONFIG.collection.enabled ? "on" : "off")
+            + "  deposit=" + (PLUGIN_CONFIG.deposit.enabled ? "on" : "off")
+            + "  free slots=" + freeInventorySlots()
+            + "  pathfinder clamped=" + pathfinderClamped());
+        final ItemStack held = CACHE.getPlayerCache().getEquipment(EquipmentSlot.MAIN_HAND);
+        out.add("held tool ok=" + HarvestPolicy.isCorrectPickaxe(held, mode())
+            + "  fortune=" + HarvestPolicy.enchantLevel(held, EnchantmentRegistry.FORTUNE.get())
+            + "  silk=" + HarvestPolicy.hasEnchant(held, EnchantmentRegistry.SILK_TOUCH.get()));
+        return out;
     }
 
     /**
@@ -556,6 +657,7 @@ public class AutoAmethystModule extends Module {
         long best = Long.MIN_VALUE;
         double bestDist = Double.MAX_VALUE;
         final double reach = effectiveReach();
+        diagRejectedNoLos = 0;
         final LongIterator it = reachable.iterator();
         while (it.hasNext()) {
             final long pos = it.nextLong();
@@ -566,7 +668,10 @@ public class AutoAmethystModule extends Module {
             if (isSkipped(pos)) continue;
             final Position c = World.blockInteractionCenter(x, y, z);
             final Vector2f rot = RotationHelper.rotationTo(c.x(), c.y(), c.z());
-            if (!BreakDriver.canEngage(x, y, z, rot, reach, harvest().requireLineOfSight)) continue;
+            if (!BreakDriver.canEngage(x, y, z, rot, reach, harvest().requireLineOfSight)) {
+                diagRejectedNoLos++;
+                continue;
+            }
             final double d = MathHelper.distanceSq3d(c.x(), c.y(), c.z(), BOT.getX(), BOT.getEyeY(), BOT.getZ());
             if (d < bestDist) {
                 bestDist = d;
@@ -700,6 +805,8 @@ public class AutoAmethystModule extends Module {
             return;
         }
         dwellTicks = 0;
+        lastWaypointStartTick = tickCounter;
+        debug("Moving to waypoint {}/{}", waypointIndex + 1, waypoints.size());
         mover.begin(movementMode(), wp[0], wp[1], wp[2]);
         state = State.MOVING;
     }

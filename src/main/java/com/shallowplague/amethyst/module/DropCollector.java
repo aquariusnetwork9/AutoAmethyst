@@ -126,13 +126,21 @@ public final class DropCollector {
             return Status.CHASING;
         }
 
-        walkToward(target.getX(), target.getZ(), cfg.sneakWhileCollecting, priority);
+        // Jump for drops the bot cannot simply walk onto: sitting on top of a block, on a ledge, or
+        // up a full block step (the 0.6 auto-step handles slabs and stairs but not a whole block).
+        // Also hop when a chase stops making progress, which is usually a lip the walk cannot clear.
+        final double dy = target.getY() - CACHE.getPlayerCache().getY();
+        final boolean jump = cfg.jumpForDrops
+            && (dy > cfg.jumpHeightThreshold || stuckTicks >= Math.max(1, cfg.jumpAfterStuckTicks));
+        walkToward(target.getX(), target.getZ(), cfg.sneakWhileCollecting,
+                   cfg.sprintWhileCollecting, jump, priority);
         return Status.CHASING;
     }
 
     /** Walks back to the anchor. Returns DONE once within {@code tolerance} horizontally. */
     public Status tickReturn(final double anchorX, final double anchorZ, final double tolerance,
-                             final boolean sneak, final int priority, final int stuckLimit) {
+                             final boolean sneak, final boolean sprint, final int priority,
+                             final int stuckLimit) {
         if (horizontalDistance(anchorX, anchorZ) <= tolerance) {
             reset();
             return Status.DONE;
@@ -144,7 +152,7 @@ public final class DropCollector {
         }
         // hasWorkNear also consults the unreachable set, so a returning bot cannot be re-triggered
         // by the same item it just gave up on
-        walkToward(anchorX, anchorZ, sneak, priority);
+        walkToward(anchorX, anchorZ, sneak, sprint, stuckTicks >= 10, priority);
         return Status.RETURNING;
     }
 
@@ -205,11 +213,18 @@ public final class DropCollector {
         return stack != null && wanted.test(stack);
     }
 
-    private void walkToward(final double x, final double z, final boolean sneak, final int priority) {
+    private void walkToward(final double x, final double z, final boolean sneak,
+                            final boolean sprint, final boolean jump, final int priority) {
         final float yaw = RotationHelper.yawToXZ(x, z);
         INPUTS.submit(InputRequest.builder()
             .owner(owner)
-            .input(Input.builder().pressingForward(true).sneaking(sneak).build())
+            .input(Input.builder()
+                .pressingForward(true)
+                .sneaking(sneak)
+                // Zenith cancels sprint whenever sneak is held, so these can never conflict.
+                .sprinting(sprint && !sneak)
+                .jumping(jump)
+                .build())
             .yaw(yaw)
             .priority(priority)
             .build());

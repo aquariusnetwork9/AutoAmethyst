@@ -11,6 +11,7 @@ import com.zenith.feature.player.raycast.RaycastHelper;
 import com.zenith.mc.block.Block;
 import com.zenith.mc.block.BlockPos;
 import com.zenith.mc.block.BlockRegistry;
+import com.zenith.util.math.MathHelper;
 import org.cloudburstmc.math.vector.Vector2f;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
 
@@ -155,7 +156,25 @@ public final class BreakDriver {
         if (!requireLineOfSight) return true;
         final BlockRaycastResult first = RaycastHelper.blockRaycastFromPos(
             BOT.getX(), BOT.getEyeY(), BOT.getZ(), rot.getX(), rot.getY(), reach, false);
-        return first.hit() && first.x() == x && first.y() == y && first.z() == z;
+        if (!first.hit()) return true; // nothing at all in the way
+        if (first.x() == x && first.y() == y && first.z() == z) return true;
+
+        // The first block the ray meets is not the target - but that does NOT mean the target is
+        // occluded. An amethyst cluster's interaction box is a small shape attached to one face of
+        // its voxel, so a ray aimed at it routinely clips the corner of an adjacent voxel (the wall
+        // the cluster is growing out of) before entering the cluster's own box. Comparing block
+        // identity therefore rejects almost every legitimately visible cluster, which is exactly
+        // what "requireLineOfSight on = nothing gets harvested" looked like.
+        //
+        // The real question is whether anything sits STRICTLY IN FRONT of the target surface, so
+        // compare how far along the ray each intersection is.
+        return distanceSqFromEye(through) <= distanceSqFromEye(first) + 1.0E-4;
+    }
+
+    private static double distanceSqFromEye(final BlockRaycastResult result) {
+        final var hit = result.intersection();
+        if (hit == null) return Double.MAX_VALUE;
+        return MathHelper.distanceSq3d(BOT.getX(), BOT.getEyeY(), BOT.getZ(), hit.x(), hit.y(), hit.z());
     }
 
     private Status blocked(final String reason) {

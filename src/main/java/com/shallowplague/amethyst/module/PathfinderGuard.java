@@ -47,11 +47,21 @@ public final class PathfinderGuard {
      * on disk are ours, not the user's, so the existing snapshot is kept rather than overwritten.
      */
     public void apply() {
+        apply(true);
+    }
+
+    /**
+     * @param sprint whether the pathfinder may sprint. Zenith's {@code allowSprint} defaults to
+     *               <b>false</b>, so a waypoint leg walks at base speed unless this turns it on -
+     *               which looks exactly like "the bot is sneaking everywhere".
+     */
+    public void apply(final boolean sprint) {
         final var pf = CONFIG.client.extra.pathfinder;
         if (!state.pathfinderClampActive) {
             state.savedAllowBreak = pf.allowBreak;
             state.savedAllowPlace = pf.allowPlace;
             state.savedAllowParkourPlace = pf.allowParkourPlace;
+            state.savedAllowSprint = pf.allowSprint;
             state.savedAllowBreakAnyway = new ArrayList<>(pf.allowBreakAnyway);
             state.pathfinderClampActive = true;
         }
@@ -59,6 +69,7 @@ public final class PathfinderGuard {
         pf.allowPlace = false;
         pf.allowParkourPlace = false;
         pf.allowBreakAnyway.clear();
+        pf.allowSprint = sprint;
     }
 
     public void restore() {
@@ -67,6 +78,7 @@ public final class PathfinderGuard {
         pf.allowBreak = state.savedAllowBreak;
         pf.allowPlace = state.savedAllowPlace;
         pf.allowParkourPlace = state.savedAllowParkourPlace;
+        pf.allowSprint = state.savedAllowSprint;
         pf.allowBreakAnyway.clear();
         if (state.savedAllowBreakAnyway != null) {
             pf.allowBreakAnyway.addAll(state.savedAllowBreakAnyway);

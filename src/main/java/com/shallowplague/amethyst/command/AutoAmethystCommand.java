@@ -63,6 +63,9 @@ public class AutoAmethystCommand extends Command {
                 "column here",
                 "collect on/off",
                 "deposit here|chest here|supply here|haul on/off|on/off|status",
+                "why",
+                "debug on/off",
+                "sprint on/off",
                 "reach <blocks>",
                 "delay <ticks>",
                 "los on/off",
@@ -367,6 +370,31 @@ public class AutoAmethystCommand extends Command {
                 PLUGIN_CONFIG.harvest.requireLineOfSight = getToggle(c, "toggle");
                 c.getSource().getEmbed()
                     .title("Line of sight requirement " + toggleStrCaps(PLUGIN_CONFIG.harvest.requireLineOfSight));
+            })))
+            .then(literal("why").executes(c -> {
+                c.getSource().getMultiLineOutput().addAll(module().diagnose());
+            }))
+            .then(literal("debug").then(argument("toggle", toggle()).executes(c -> {
+                PLUGIN_CONFIG.stats.debug = getToggle(c, "toggle");
+                c.getSource().getEmbed()
+                    .title("Debug logging " + toggleStrCaps(PLUGIN_CONFIG.stats.debug))
+                    .description("Logs a full diagnosis every "
+                        + PLUGIN_CONFIG.stats.debugIntervalTicks + " ticks.");
+            })))
+            .then(literal("sprint").then(argument("toggle", toggle()).executes(c -> {
+                PLUGIN_CONFIG.movement.sprint = getToggle(c, "toggle");
+                PLUGIN_CONFIG.collection.sprintWhileCollecting = PLUGIN_CONFIG.movement.sprint;
+                module().requestReload();
+                c.getSource().getEmbed()
+                    .title("Sprint " + toggleStrCaps(PLUGIN_CONFIG.movement.sprint))
+                    .description("Applies to the hand driven walk and to the pathfinder.");
+            })))
+            .then(literal("sneak").then(argument("toggle", toggle()).executes(c -> {
+                PLUGIN_CONFIG.movement.sneakWhileWalking = getToggle(c, "toggle");
+                PLUGIN_CONFIG.collection.sneakWhileCollecting = PLUGIN_CONFIG.movement.sneakWhileWalking;
+                c.getSource().getEmbed()
+                    .title("Sneak " + toggleStrCaps(PLUGIN_CONFIG.movement.sneakWhileWalking))
+                    .description("Sneaking is slow but keeps vanilla ledge protection on.");
             })))
             .then(literal("tool").then(argument("toggle", toggle()).executes(c -> {
                 PLUGIN_CONFIG.tool.enabled = getToggle(c, "toggle");

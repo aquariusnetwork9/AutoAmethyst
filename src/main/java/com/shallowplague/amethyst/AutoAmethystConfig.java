@@ -185,11 +185,24 @@ public class AutoAmethystConfig {
         public double climbTolerance = 0.2;
 
         /**
-         * Sneak while walking legs. Strongly recommended on a scaffolding rig: it enables vanilla
-         * ledge protection so the bot cannot walk off a platform, and the lower speed stops it
-         * overshooting stand positions. Costs nothing that matters, since growth is the bottleneck.
+         * Sneak while walking. Off by default - it is roughly a third of walking speed, and the
+         * ledge protection it buys only matters on a rig with open drops. Turn it back on if the
+         * bot keeps walking off something.
          */
-        public boolean sneakWhileWalking = true;
+        public boolean sneakWhileWalking = false;
+
+        /**
+         * Run. Applies both to the hand driven walk and to Zenith's pathfinder, whose own
+         * {@code allowSprint} defaults to <b>false</b> - which is why a waypoint leg crawls even
+         * when nothing is sneaking.
+         */
+        public boolean sprint = true;
+
+        /** Jump when blocked, to get up a full block step the 0.6 auto-step cannot manage. */
+        public boolean jumpWhenStuck = true;
+
+        /** Ticks of no progress before trying a jump. */
+        public int jumpAfterStuckTicks = 10;
     }
 
     public final Collection collection = new Collection();
@@ -214,8 +227,23 @@ public class AutoAmethystConfig {
         /** Ticks of no measurable movement before a chase is considered stuck. */
         public int stuckTicks = 40;
 
-        /** Sneak while collecting. Keeps vanilla ledge protection on inside the rig. */
-        public boolean sneakWhileCollecting = true;
+        /** Sneak while collecting. Off by default; sneaking makes chasing a drop very slow. */
+        public boolean sneakWhileCollecting = false;
+
+        /** Run while chasing drops. */
+        public boolean sprintWhileCollecting = true;
+
+        /**
+         * Jump for drops that are above the bot - on top of a block, on a ledge, or up a step the
+         * 0.6 block auto-step cannot clear. Also used to hop when a chase stops making progress.
+         */
+        public boolean jumpForDrops = true;
+
+        /** How far above the bot's feet a drop must be before jumping at it. */
+        public double jumpHeightThreshold = 0.55;
+
+        /** Ticks of no progress in a chase before trying a jump. */
+        public int jumpAfterStuckTicks = 10;
 
         /** How close to the stand position counts as "back". */
         public double returnTolerance = 0.6;
@@ -334,6 +362,7 @@ public class AutoAmethystConfig {
         public boolean savedAllowBreak = true;
         public boolean savedAllowPlace = true;
         public boolean savedAllowParkourPlace = false;
+        public boolean savedAllowSprint = false;
         public List<String> savedAllowBreakAnyway = new ArrayList<>();
     }
 
@@ -354,5 +383,15 @@ public class AutoAmethystConfig {
 
         /** Emit a rolling summary to the module log this often. 0 disables. */
         public int summaryIntervalTicks = 12000;
+
+        /**
+         * Log a full diagnosis every {@link #debugIntervalTicks} explaining what the module is doing
+         * and, more usefully, why it is <i>not</i> doing anything. Turn on with
+         * {@code autoamethyst debug on}; the same report is available on demand via
+         * {@code autoamethyst why}.
+         */
+        public boolean debug = false;
+
+        public int debugIntervalTicks = 100;
     }
 }
