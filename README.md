@@ -88,8 +88,13 @@ off rather than chased forever.
    fresh empty one from inventory, carry on
 3. when there is nothing left to deposit: carry every filled shulker to the **storage chest** and
    leave them there
-4. restock empty shulkers from the **supply chest** if it is running low
-5. walk back to the stand position it was harvesting from
+4. walk back to the stand position it was harvesting from
+
+Empty shulkers come from a **supply chest**, pulled **one at a time and placed immediately** — the
+bot never carries a stock of them. When it needs one and has none, it walks to the supply chest,
+takes exactly one, comes back and places it. A pocket full of empty shulkers is inventory the
+harvest cannot use, and the trip is cheap next to how long a shulker takes to fill: 27 slots at
+~8.8 shards a cluster is thousands of clusters, which is many hours of growth.
 
 Set both chests by standing next to them and running `deposit chest here` and `deposit supply here`
 — each finds the nearest container within 4 blocks, so you never type a coordinate. Any container
@@ -101,12 +106,11 @@ holds something unexpected fails the run with a reason rather than being cleared
 confirms a block really is a container before right-clicking it, so a stale position cannot have it
 poking at whatever ended up there.
 
-The restock is demand-driven as well as scheduled: if the bot runs out of empties *mid-run* — the
-normal steady state once its carried stock is used up — it walks to the supply chest, takes
-`emptiesPerTrip` of them, comes back and carries on, rather than failing the cycle. Trips are
-budgeted per run so an empty supply chest cannot loop.
+Restocking is purely demand-driven — there is no scheduled top-up, because that is what would build
+up a stockpile. Trips are budgeted per run so an empty supply chest fails with a reason instead of
+looping.
 
-Step 5 is not cosmetic. Without it the bot finishes standing at a chest, re-anchors there, and in
+Step 4 is not cosmetic. Without it the bot finishes standing at a chest, re-anchors there, and in
 stationary mode never returns to the geode — the farm looks alive and produces nothing.
 
 If the inventory fills with *filled* shulkers and no chest is set, the module pauses and tells you,

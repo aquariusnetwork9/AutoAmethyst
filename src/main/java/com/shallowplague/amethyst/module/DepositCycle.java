@@ -39,6 +39,8 @@ import static com.zenith.Globals.INVENTORY;
  *       place a fresh empty one, carry on</li>
  *   <li>when the inventory has nothing left to deposit: haul every full shulker to the storage
  *       chest and leave them there</li>
+ *   <li>empty shulkers come from a supply chest <b>one at a time, placed immediately</b> - the bot
+ *       never carries a stock of them, since that is inventory the harvest cannot use</li>
  *   <li>walk back to the stand position the harvest loop was using</li>
  * </ol>
  *
@@ -108,8 +110,6 @@ public final class DepositCycle {
     private int shulkersStored = 0;
     private int fullShulkersBeforeChest = 0;
     private int supplyTrips = 0;
-    /** Where to go once a restock trip finishes - it is reached from two different places. */
-    private Phase afterSupply = Phase.RETURN;
     private String failReason = "";
 
     /** Where the harvest loop was standing, so the run can put the bot back afterwards. */
@@ -144,7 +144,6 @@ public final class DepositCycle {
         repathCooldown = 0;
         reopens = 0;
         supplyTrips = 0;
-        afterSupply = Phase.RETURN;
         failReason = "";
         breaker.reset();
         shulkerCollector.reset();
@@ -175,12 +174,13 @@ public final class DepositCycle {
             case CHEST_OPEN -> open(cfg.chestX, cfg.chestY, cfg.chestZ, cfg, reach, requireLineOfSight,
                                     priority, Phase.CHEST_TRANSFER);
             case CHEST_TRANSFER -> transfer(DepositCycle::isFullShulkerItem, cfg, Phase.CHEST_CLOSE, false);
-            case CHEST_CLOSE -> closeThenMaybeRestock(cfg);
+            case CHEST_CLOSE -> close(Phase.RETURN);
             case SUPPLY_APPROACH -> approach(cfg.supplyX, cfg.supplyY, cfg.supplyZ, cfg, reach, Phase.SUPPLY_OPEN);
             case SUPPLY_OPEN -> open(cfg.supplyX, cfg.supplyY, cfg.supplyZ, cfg, reach, requireLineOfSight,
                                      priority, Phase.SUPPLY_TAKE);
             case SUPPLY_TAKE -> takeEmptyShulkers(cfg);
-            case SUPPLY_CLOSE -> close(afterSupply);
+            // Back to the deposit spot to place the one shulker we just took, immediately.
+            case SUPPLY_CLOSE -> close(Phase.APPROACH);
             case RETURN -> tickReturn(cfg, reach);
             case IDLE -> Status.DONE;
         };
@@ -338,25 +338,6 @@ public final class DepositCycle {
         return Status.BUSY;
     }
 
-    /**
-     * Closes the storage chest, then decides whether to detour for empty shulkers.
-     *
-     * <p>The decision is deliberately made only once the window is actually shut, not computed
-     * alongside the close: this phase runs every tick until the container closes, and evaluating
-     * the decision each time would burn the whole restock-trip budget in a couple of ticks.
-     */
-    private Status closeThenMaybeRestock(final AutoAmethystConfig.Deposit cfg) {
-        if (openContainerId() != 0) {
-            INVENTORY.submit(InventoryActionRequest.builder()
-                .owner(owner)
-                .actions(new CloseContainer())
-                .priority(0)
-                .build());
-            return Status.BUSY;
-        }
-        advance(startSupplyTripIfNeeded(cfg, Phase.RETURN));
-        return Status.BUSY;
-    }
 
     // ------------------------------------------------------------------ shulker phases
 
@@ -398,8 +379,6 @@ public final class DepositCycle {
             // the normal steady state once the carried stock is used up.
             if (cfg.supplySet && supplyTrips < Math.max(1, cfg.maxSupplyTrips)) {
                 supplyTrips++;
-                // come back via APPROACH so the bot walks to the deposit spot before placing
-                afterSupply = Phase.APPROACH;
                 advance(Phase.SUPPLY_APPROACH);
                 return Status.BUSY;
             }
@@ -472,26 +451,15 @@ public final class DepositCycle {
     // ------------------------------------------------------------------ supply chest
 
     /**
-     * Decides whether to detour to the supply chest before {@code next}, and sets up the return.
+     * Pulls <b>exactly one</b> empty shulker out of the open supply chest.
      *
-     * <p>Called after the storage chest visit, which is the natural moment to restock: the bot has
-     * just handed over the filled shulkers and is already away from the geode.
-     */
-    private Phase startSupplyTripIfNeeded(final AutoAmethystConfig.Deposit cfg, final Phase next) {
-        if (!cfg.supplySet) return next;
-        if (countEmptyShulkers() >= Math.max(1, cfg.minEmptyShulkers)) return next;
-        if (supplyTrips >= Math.max(1, cfg.maxSupplyTrips)) return next;
-        supplyTrips++;
-        afterSupply = next;
-        return Phase.SUPPLY_APPROACH;
-    }
-
-    /**
-     * Pulls empty shulkers out of the open supply chest and into the inventory.
+     * <p>One at a time, on demand, placed immediately - the bot never stockpiles empties. That is
+     * the point: a pocket full of empty shulkers is inventory the harvest cannot use, and the trip
+     * is cheap relative to how long a shulker takes to fill (27 slots at ~8.8 shards a cluster is
+     * thousands of clusters, which is many hours of growth).
      *
-     * <p>The mirror image of {@link #transfer}: container half to player half, two clicks per stack
-     * (pick up, put down), paced the same way. Stops once the bot is carrying {@code emptiesPerTrip}
-     * or the chest has no more empties to give.
+     * <p>The mirror image of {@link #transfer}: container half to player half, two clicks (pick up,
+     * put down), paced the same way.
      */
     private Status takeEmptyShulkers(final AutoAmethystConfig.Deposit cfg) {
         final Container container = CACHE.getPlayerCache().getInventoryCache().getOpenContainer();
@@ -520,14 +488,13 @@ public final class DepositCycle {
             return Status.BUSY;
         }
 
-        if (countEmptyShulkers() >= Math.max(1, cfg.emptiesPerTrip)) {
+        // One is all we came for.
+        if (countEmptyShulkers() >= 1) {
             advance(Phase.SUPPLY_CLOSE);
             return Status.BUSY;
         }
         if (findFreePlayerSlot(container) < 0) {
-            // carrying all we can
-            advance(Phase.SUPPLY_CLOSE);
-            return Status.BUSY;
+            return fail("no free inventory slot to take an empty shulker into");
         }
 
         final int source = findContainerSlotMatching(container, playerStart, DepositCycle::isEmptyShulkerItem);

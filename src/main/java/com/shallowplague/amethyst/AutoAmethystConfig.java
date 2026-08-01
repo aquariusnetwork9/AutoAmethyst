@@ -264,14 +264,14 @@ public class AutoAmethystConfig {
         public int supplyY = 0;
         public int supplyZ = 0;
 
-        /** How many empty shulkers to pick up per restock trip, so it is not one trip per shulker. */
-        public int emptiesPerTrip = 3;
-
-        /** Restock when carrying fewer empties than this after visiting the storage chest. */
-        public int minEmptyShulkers = 2;
-
-        /** Restock trips allowed per deposit run before giving up on the supply chest. */
-        public int maxSupplyTrips = 2;
+        /**
+         * Restock trips allowed per deposit run before giving up on the supply chest.
+         *
+         * <p>The bot deliberately takes <b>exactly one</b> empty shulker per trip and places it
+         * immediately, rather than stocking up - so a run that fills more than one shulker makes
+         * more than one trip. This budget only exists to stop an empty supply chest looping.
+         */
+        public int maxSupplyTrips = 3;
 
         /**
          * How close counts as "back at the stand position" when the run walks the bot home. The
