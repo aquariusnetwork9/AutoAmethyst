@@ -169,7 +169,7 @@ public final class DepositCycle {
             case CLOSE_FULL -> close(Phase.BREAK_SHULKER);
             case BREAK_SHULKER -> tickBreakShulker(cfg, reach, requireLineOfSight, priority);
             case COLLECT_SHULKER -> tickCollectShulker(cfg, priority);
-            case CLOSE_DONE -> close(needsChestTrip(cfg) ? Phase.CHEST_APPROACH : Phase.RETURN);
+            case CLOSE_DONE -> closeThenMaybeHaul(cfg);
             case CHEST_APPROACH -> approach(cfg.chestX, cfg.chestY, cfg.chestZ, cfg, reach, Phase.CHEST_OPEN);
             case CHEST_OPEN -> open(cfg.chestX, cfg.chestY, cfg.chestZ, cfg, reach, requireLineOfSight,
                                     priority, Phase.CHEST_TRANSFER);
@@ -489,7 +489,14 @@ public final class DepositCycle {
         }
 
         // One is all we came for.
-        if (countEmptyShulkers() >= 1) {
+        //
+        // Counted from the OPEN WINDOW's player half, not from PlayerCache.getPlayerInventory().
+        // That returns inventory container 0, which does NOT update while any container is open -
+        // it only re-syncs on close. Reading it here always returned the count from before the
+        // window opened, so the "I already have one, stop" test never fired and the bot kept
+        // pulling shulkers until the inventory was full and the run died. That is the
+        // "pulled a bunch of shulkers and never deposited" failure.
+        if (countEmptyShulkersInWindow(container) >= 1) {
             advance(Phase.SUPPLY_CLOSE);
             return Status.BUSY;
         }
@@ -505,7 +512,7 @@ public final class DepositCycle {
             return Status.BUSY;
         }
 
-        final int carried = countEmptyShulkers();
+        final int carried = countEmptyShulkersInWindow(container);
         if (lastTransferCount >= 0 && carried <= lastTransferCount) {
             if (++stallCount > Math.max(3, cfg.maxStalledSteps)) {
                 return fail("could not take shulkers from the supply chest (server rejecting clicks?)");
@@ -520,6 +527,27 @@ public final class DepositCycle {
     }
 
     // ------------------------------------------------------------------ chest trip / return
+
+    /**
+     * Closes the deposit shulker, then decides whether to haul filled ones to the chest.
+     *
+     * <p>The decision is made only once the window is actually shut. {@link #needsChestTrip} counts
+     * filled shulkers via {@code getPlayerInventory()}, which is inventory container 0 and is stale
+     * for as long as a window is open - so asking while the shulker is still open would count what
+     * the bot had before the deposit, not after it.
+     */
+    private Status closeThenMaybeHaul(final AutoAmethystConfig.Deposit cfg) {
+        if (openContainerId() != 0) {
+            INVENTORY.submit(InventoryActionRequest.builder()
+                .owner(owner)
+                .actions(new CloseContainer())
+                .priority(0)
+                .build());
+            return Status.BUSY;
+        }
+        advance(needsChestTrip(cfg) ? Phase.CHEST_APPROACH : Phase.RETURN);
+        return Status.BUSY;
+    }
 
     /** Whether there are full shulkers to haul and somewhere configured to put them. */
     private boolean needsChestTrip(final AutoAmethystConfig.Deposit cfg) {
@@ -649,17 +677,40 @@ public final class DepositCycle {
         return count;
     }
 
-    private static int countEmptyShulkers() {
-        final var inv = CACHE.getPlayerCache().getPlayerInventory();
+    /**
+     * Counts filled shulkers the bot is carrying, reading whichever view is actually live: the open
+     * window's player half if a container is open, otherwise the standalone inventory.
+     */
+    private static int countCarriedFullShulkers() {
+        final Container open = CACHE.getPlayerCache().getInventoryCache().getOpenContainer();
+        if (open.getContainerId() == 0) return countFullShulkers();
         int count = 0;
-        for (int slot = 9; slot <= 44; slot++) {
-            if (isEmptyShulkerItem(inv.get(slot))) count++;
+        final int playerStart = open.getSize() - 36;
+        for (int i = playerStart; i < open.getSize(); i++) {
+            if (isFullShulkerItem(open.getItemStack(i))) count++;
         }
         return count;
     }
 
     public static boolean isEmptyShulkerItem(final @Nullable ItemStack stack) {
         return HarvestPolicy.isShulkerItem(stack) && shulkerIsEmpty(stack);
+    }
+
+    /**
+     * Counts empty shulkers in the open window's player half.
+     *
+     * <p>Any in-cycle inventory question asked while a container is open MUST be answered from the
+     * window, never from {@code PlayerCache.getPlayerInventory()}: that is inventory container 0,
+     * which does not re-sync until the window closes, so it cannot see anything the bot has moved
+     * during this cycle.
+     */
+    private static int countEmptyShulkersInWindow(final Container container) {
+        final int playerStart = container.getSize() - 36;
+        int count = 0;
+        for (int i = playerStart; i < container.getSize(); i++) {
+            if (isEmptyShulkerItem(container.getItemStack(i))) count++;
+        }
+        return count;
     }
 
     private static int findContainerSlotMatching(final Container container, final int playerStart,
@@ -695,17 +746,18 @@ public final class DepositCycle {
 
     private void advance(final Phase next) {
         // Count what actually left the inventory, not what we hoped to move.
+        // Window-aware: both of these run while the chest is open, where the standalone inventory
+        // view is stale and would report the counts from before the transfer.
         if (next == Phase.CHEST_TRANSFER) {
-            fullShulkersBeforeChest = countFullShulkers();
+            fullShulkersBeforeChest = countCarriedFullShulkers();
         } else if (phase == Phase.CHEST_TRANSFER) {
-            shulkersStored += Math.max(0, fullShulkersBeforeChest - countFullShulkers());
+            shulkersStored += Math.max(0, fullShulkersBeforeChest - countCarriedFullShulkers());
         }
         phase = next;
         phaseTicks = 0;
     }
 
     private Status fail(final String reason) {
-        failReason = reason;
         // leave the window closed rather than stranded open
         if (openContainerId() != 0) {
             INVENTORY.submit(InventoryActionRequest.builder()
@@ -714,7 +766,12 @@ public final class DepositCycle {
                 .priority(0)
                 .build());
         }
+        final String phaseAtFailure = phase.name();
         reset();
+        // Set AFTER reset, which clears it. Setting it first meant every single deposit failure
+        // reported an empty reason - the module logged "deposit failed: " with nothing after it,
+        // so a broken run gave no clue at all about what broke.
+        failReason = reason + " (in phase " + phaseAtFailure + ")";
         return Status.FAILED;
     }
 }
