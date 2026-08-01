@@ -69,6 +69,8 @@ public final class DropCollector {
     private double lastDistToTarget = -1;
     /** Latches once this target has been handed to the pathfinder, to stop the decision flapping. */
     private boolean escalated;
+    /** Latches when the pathfinder refused this target, so the hand walk gets it instead. */
+    private boolean pathRefused;
 
     /**
      * The leash actually in force. Pathed chases get a longer one, because shards fall to whatever
@@ -101,6 +103,7 @@ public final class DropCollector {
         noProgressTicks = 0;
         lastDistToTarget = -1;
         escalated = false;
+        pathRefused = false;
         failReason = "";
     }
 
@@ -128,6 +131,7 @@ public final class DropCollector {
         noProgressTicks = 0;
         lastDistToTarget = -1;
         escalated = false;
+        pathRefused = false;
         return Status.FAILED;
     }
 
@@ -209,6 +213,7 @@ public final class DropCollector {
         // and since giving up on a path resets the repath cooldown, the flapping fired a fresh path
         // request every other tick - which is the "Calculated path to goal" storm in the log.
         if (cfg.usePathfinder
+            && !pathRefused
             && (escalated
                 || Math.abs(dy) > cfg.pathfinderHeightThreshold
                 || stuckTicks >= Math.max(1, cfg.escalateToPathTicks)
@@ -258,8 +263,23 @@ public final class DropCollector {
             if (BARITONE.isActive()) {
                 pathIdleTicks = 0;
             } else if (++pathIdleTicks > Math.max(10, cfg.pathGiveUpTicks)) {
+                // The pathfinder would not route here. Do NOT give up - hand the chase back to the
+                // plain walk, which can reach plenty of places the planner refuses.
+                //
+                // The big one is budding amethyst. Zenith's MovementHelper#isBlockNormalCube
+                // excludes every block whose name contains "amethyst" except plain amethyst_block,
+                // so the planner treats a budding block as unwalkable even though it is an ordinary
+                // full cube you can stand on in vanilla - and shards land on top of them constantly.
+                // That rule lives in core and a plugin cannot change it, but the hand walk never
+                // consults it.
                 stopPathing();
-                return abandonCurrent("no route to the drop (unreachable without breaking blocks)");
+                pathRefused = true;
+                // Fresh budget for the hand walk. The pathed attempt has already spent part of the
+                // chase, and handing the fallback a nearly-expired clock would fail it immediately.
+                chaseTicks = 0;
+                noProgressTicks = 0;
+                lastDistToTarget = -1;
+                return Status.CHASING;
             }
         }
 
@@ -356,6 +376,7 @@ public final class DropCollector {
             noProgressTicks = 0;
             lastDistToTarget = -1;
             escalated = false;
+            pathRefused = false;
             snapshotPosition();
         }
         return next;
