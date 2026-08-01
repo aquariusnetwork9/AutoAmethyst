@@ -15,6 +15,7 @@ import com.zenith.mc.block.BlockPos;
 import com.zenith.mc.enchantment.EnchantmentRegistry;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
+import com.zenith.Proxy;
 import com.zenith.module.api.Module;
 import com.zenith.util.math.MathHelper;
 import com.zenith.util.timer.Timer;
@@ -97,8 +98,12 @@ public class AutoAmethystModule extends Module {
     private long tickCounter = 0;
     private int settleTicks = 0;
     private int toolWaitTicks = 0;
+    /** Consecutive ticks with no usable pickaxe, so a momentary desync cannot latch a pause. */
+    private int noToolTicks = 0;
     private int dwellTicks = 0;
     private int waypointIndex = 0;
+    /** Consecutive unreachable waypoints, so one bad one skips instead of stopping the farm. */
+    private int failedWaypoints = 0;
     private boolean visitedAnyWaypoint = false;
     private int consecutiveFailures = 0;
 
@@ -199,9 +204,11 @@ public class AutoAmethystModule extends Module {
         pauseReason = "";
         settleTicks = 0;
         toolWaitTicks = 0;
+        noToolTicks = 0;
         dwellTicks = 0;
         visitedAnyWaypoint = false;
         consecutiveFailures = 0;
+        failedWaypoints = 0;
         anchorSet = false;
         reachable.clear();
         skipUntil.clear();
@@ -245,6 +252,14 @@ public class AutoAmethystModule extends Module {
             info("Reloaded configuration");
         }
         if (paused) return;
+        // The 2b2t queue ticks the bot like any other world, but the inventory and chunks are not
+        // the real ones. Deciding anything here produces confident nonsense - most memorably
+        // "no non-Silk pickaxe above 10% durability" one second after queueing, latched as a sticky
+        // pause that survived into the actual world with a perfectly good Fortune III pick in hand.
+        if (Proxy.getInstance().isInQueue()) {
+            releaseBreak();
+            return;
+        }
         if (!CACHE.getPlayerCache().isAlive()) {
             releaseBreak();
             return;
@@ -347,12 +362,25 @@ public class AutoAmethystModule extends Module {
             rescan();
         }
 
-        // Pick drops up before breaking more. Keeps the floor clean and the inventory honest.
-        if (PLUGIN_CONFIG.collection.enabled
-            && collector.hasWorkNear(this::isOurYield, anchorX, anchorY, anchorZ,
-                                     PLUGIN_CONFIG.collection.maxDistance)) {
-            state = State.COLLECTING;
-            return;
+        // Collect, but never at the expense of harvesting.
+        //
+        // This used to run before the harvest check, so any drop within the leash took priority over
+        // breaking. In a real geode a fair number of shards land somewhere the bot cannot get to -
+        // inside the rig, under the floor, on the far side of a wall - and each one costs a full
+        // chase timeout. With 200+ mature clusters standing there, the bot spent all its time
+        // failing to reach shards and almost none of it harvesting.
+        //
+        // So: only chase when there is nothing to break in reach, or when the drop is close enough
+        // to grab without really interrupting anything.
+        if (PLUGIN_CONFIG.collection.enabled) {
+            final double radius = reachable.isEmpty()
+                ? PLUGIN_CONFIG.collection.maxDistance
+                : PLUGIN_CONFIG.collection.opportunisticRadius;
+            if (radius > 0
+                && collector.hasWorkNear(this::isOurYield, anchorX, anchorY, anchorZ, radius)) {
+                state = State.COLLECTING;
+                return;
+            }
         }
 
         if (reachable.isEmpty()) {
@@ -482,6 +510,7 @@ public class AutoAmethystModule extends Module {
             case BUSY -> { }
             case ARRIVED -> {
                 dwellTicks = 0;
+                failedWaypoints = 0;
                 setAnchorHere();
                 // drops that were unreachable from the last stand position may well be reachable
                 // from this one
@@ -489,7 +518,20 @@ public class AutoAmethystModule extends Module {
                 scanTimer.skip();
                 state = State.SCAN;
             }
-            case FAILED -> pause("movement failed: " + mover.failReason());
+            case FAILED -> {
+                // One unroutable waypoint must not stop the farm. Chunks unload, mobs stand in
+                // doorways, and a stand position recorded on a ladder may not be standable at all -
+                // none of which says anything about the other waypoints. Try the next one, and only
+                // give up once a full cycle has failed.
+                warn("Waypoint {} unreachable: {}", waypointIndex + 1, mover.failReason());
+                if (++failedWaypoints >= Math.max(1, PLUGIN_CONFIG.movement.waypoints.size())) {
+                    pause("no waypoint could be reached (last: " + mover.failReason() + ")");
+                    return;
+                }
+                setAnchorHere();
+                dwellTicks = Integer.MAX_VALUE / 2; // move on immediately rather than dwelling
+                state = State.SCAN;
+            }
         }
     }
 
@@ -845,9 +887,19 @@ public class AutoAmethystModule extends Module {
         if (slot < 0) {
             if (heldOk) {
                 toolWaitTicks = 0;
+                noToolTicks = 0;
                 return true;
             }
-            if (cfg.pauseWhenNoTool) {
+            // An inventory that reads as entirely empty has not been synced yet - on a reconnect or
+            // a world change the cache is briefly blank. Never conclude anything from that.
+            if (inventoryLooksUnsynced()) {
+                noToolTicks = 0;
+                return false;
+            }
+            // Only pause once the condition has held for a while. Pausing is sticky and needs a
+            // manual resume, so a momentary desync must not be able to switch the farm off for
+            // hours - which is exactly what happened when a queue tick reported an empty inventory.
+            if (cfg.pauseWhenNoTool && ++noToolTicks >= Math.max(20, cfg.noToolGraceTicks)) {
                 pause(m == HarvestPolicy.Mode.SILK
                     ? "no Silk Touch pickaxe above " + cfg.swapAtDurabilityPercent + "% durability"
                     : "no non-Silk pickaxe above " + cfg.swapAtDurabilityPercent + "% durability");
@@ -855,9 +907,10 @@ public class AutoAmethystModule extends Module {
             }
             toolWaitTicks = 0;
             if (HarvestPolicy.isCorrectPickaxe(held, m)) return true;
-            if (tickCounter % 200 == 0) warn("No suitable pickaxe in inventory; idling");
+            if (tickCounter % 200 == 0) warn("No suitable pickaxe in inventory; waiting");
             return false;
         }
+        noToolTicks = 0;
 
         if (heldOk) {
             // Fortune is worth a swap in SHARDS mode: Fortune III averages 8.8 shards per cluster
@@ -902,6 +955,21 @@ public class AutoAmethystModule extends Module {
         toolSwaps++;
         info("Swapping pickaxe (slot {})", slot);
         return false;
+    }
+
+    /**
+     * True when the inventory cache looks like it has not been populated yet.
+     *
+     * <p>A real bot always has something in 36 slots' worth of inventory; entirely empty means the
+     * cache is blank, which happens briefly on connect, on a world change and throughout the 2b2t
+     * queue. Concluding "you have no pickaxe" from that is how a farm switches itself off.
+     */
+    private boolean inventoryLooksUnsynced() {
+        final List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
+        for (int slot = 9; slot <= 44; slot++) {
+            if (inv.get(slot) != Container.EMPTY_STACK) return false;
+        }
+        return true;
     }
 
     private boolean needsSwap(final @Nullable ItemStack stack) {

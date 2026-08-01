@@ -1,7 +1,8 @@
 package com.shallowplague.amethyst.module;
 
 import com.shallowplague.amethyst.AutoAmethystConfig;
-import com.zenith.feature.pathfinder.goals.GoalBlock;
+import com.zenith.feature.pathfinder.goals.GoalNear;
+import com.zenith.mc.block.BlockPos;
 import com.zenith.feature.player.Input;
 import com.zenith.feature.player.InputRequest;
 import com.zenith.feature.player.RotationHelper;
@@ -101,7 +102,11 @@ public final class MovementDriver {
         switch (mode) {
             case WAYPOINT -> {
                 phase = Phase.PATHING;
-                BARITONE.pathTo(new GoalBlock(x, y, z));
+                // GoalNear, not GoalBlock. GoalBlock demands the bot stand on that exact block, and
+                // a stand position recorded while on a ladder or against a wall often is not
+                // standable - the pathfinder then reports "No path found" for somewhere the bot can
+                // plainly get next to. Landing a block off is fine; reach is 4.5.
+                BARITONE.pathTo(new GoalNear(new BlockPos(x, y, z), 1));
             }
             case SCAFFOLD -> phase = Phase.WALK_TO_COLUMN;
             case STATIONARY -> phase = Phase.NONE;
@@ -144,10 +149,14 @@ public final class MovementDriver {
             return arrive();
         }
         if (legTicks > PATH_GRACE_TICKS && !BARITONE.isActive()) {
-            // pathfinder finished or gave up without putting us on the waypoint. On a scaffolding
-            // rig this is the expected outcome - the path planner has no scaffolding movement.
-            return fail("pathfinder stopped short of the waypoint"
-                + " (scaffolding is not routable; use ladders or SCAFFOLD mode)");
+            // Pathing ended without landing exactly on the waypoint. If we got near enough, take
+            // it: the recorded block itself may simply not be standable, and reach is 4.5 anyway.
+            if (horizontalDistanceTo(targetX, targetZ) <= 2.0
+                && Math.abs(CACHE.getPlayerCache().getY() - targetY) <= 1.5) {
+                return arrive();
+            }
+            return fail("no route to the waypoint - the pathfinder gave up"
+                + " (it cannot break or place, by design; scaffolding is also not routable)");
         }
         return Status.BUSY;
     }
@@ -308,8 +317,11 @@ public final class MovementDriver {
     }
 
     private Status fail(final String reason) {
-        failReason = reason;
+        final String phaseAtFailure = phase.name();
         reset();
+        // Set AFTER reset, which clears it - the same trap the deposit cycle had. Setting it first
+        // meant every movement failure logged "movement failed: " with nothing after it.
+        failReason = reason + " (in phase " + phaseAtFailure + ")";
         return Status.FAILED;
     }
 }

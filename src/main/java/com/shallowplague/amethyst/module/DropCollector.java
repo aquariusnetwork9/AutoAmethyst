@@ -40,8 +40,12 @@ public final class DropCollector {
 
     private final Object owner;
 
-    /** Ticks between path requests; path calculation is async, so re-issuing every tick stalls it. */
-    private static final int REPATH_COOLDOWN_TICKS = 20;
+    /**
+     * Ticks between path requests. Path calculation is async, so re-issuing every tick stalls it -
+     * and dropped items drift, so a short cooldown had the bot recalculating a path every second
+     * and filling the log with it. A shard is not going anywhere; it can wait two seconds.
+     */
+    private static final int REPATH_COOLDOWN_TICKS = 40;
 
     private @Nullable Integer targetEntityId;
     private int chaseTicks;

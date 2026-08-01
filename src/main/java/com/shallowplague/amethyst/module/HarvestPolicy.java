@@ -5,6 +5,7 @@ import com.zenith.mc.block.Block;
 import com.zenith.mc.block.BlockRegistry;
 import com.zenith.mc.block.BlockTags;
 import com.zenith.feature.player.World;
+import com.zenith.util.math.MathHelper;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.mc.item.ToolTag;
@@ -118,10 +119,31 @@ public final class HarvestPolicy {
         if (!World.isChunkLoadedBlockPos(x, z)) return false;
         if (!World.getBlock(x, y, z).isAir()) return false;
         for (final int[] d : FACE_OFFSETS) {
-            final Block neighbour = World.getBlock(x + d[0], y + d[1], z + d[2]);
-            if (isAmethystGrowth(neighbour)) return false;
+            // Only budding amethyst matters. Its six faces are the growth sites, so a block sitting
+            // on one stops that face producing. Being next to an existing bud or cluster is
+            // harmless - growth comes out of the budding block, not out of them - and refusing
+            // those too ruled out otherwise perfectly good deposit spots anywhere near the geode.
+            if (World.getBlock(x + d[0], y + d[1], z + d[2]) == BlockRegistry.BUDDING_AMETHYST) {
+                return false;
+            }
         }
         return true;
+    }
+
+    /**
+     * Whether the bot's own body is in the way of a placement.
+     *
+     * <p>Zenith refuses to place into a block occupied by anything that blocks building, and the
+     * bot counts. Standing on the spot it is trying to fill is an easy state to reach - the deposit
+     * position used to be set to the bot's own feet - and it fails silently forever, because
+     * nothing about the position ever changes.
+     */
+    public static boolean selfOccupies(final int x, final int y, final int z) {
+        final int bx = MathHelper.floorI(BOT.getX());
+        final int by = MathHelper.floorI(BOT.getY());
+        final int bz = MathHelper.floorI(BOT.getZ());
+        // the player is a bit under two blocks tall, so it fills its feet block and the one above
+        return bx == x && bz == z && (by == y || by + 1 == y);
     }
 
     private static final int[][] FACE_OFFSETS = {

@@ -5,6 +5,7 @@ import com.zenith.cache.data.inventory.Container;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.ClickItem;
 import com.zenith.feature.inventory.actions.CloseContainer;
+import com.zenith.feature.pathfinder.Baritone;
 import com.zenith.feature.player.ClickTarget;
 import com.zenith.feature.player.Input;
 import com.zenith.feature.player.InputRequest;
@@ -110,6 +111,7 @@ public final class DepositCycle {
     private int shulkersStored = 0;
     private int fullShulkersBeforeChest = 0;
     private int supplyTrips = 0;
+    private int stepAsideTicks = 0;
     private String failReason = "";
 
     /** Where the harvest loop was standing, so the run can put the bot back afterwards. */
@@ -144,6 +146,7 @@ public final class DepositCycle {
         repathCooldown = 0;
         reopens = 0;
         supplyTrips = 0;
+        stepAsideTicks = 0;
         failReason = "";
         breaker.reset();
         shulkerCollector.reset();
@@ -359,6 +362,18 @@ public final class DepositCycle {
     }
 
     private Status tickPlaceShulker(final AutoAmethystConfig.Deposit cfg) {
+        // Get out of our own way first. Zenith refuses to place into a block occupied by anything
+        // that blocks building, and the bot counts - it logs "an entity is blocking the place
+        // position" and stops, forever, because standing still changes nothing. This is easy to
+        // reach because the deposit position used to be set to the bot's own feet.
+        if (HarvestPolicy.selfOccupies(cfg.x, cfg.y, cfg.z)) {
+            if (++stepAsideTicks > 60) {
+                return fail("standing in the deposit position and could not step out of it");
+            }
+            stepAsideFrom(cfg.x, cfg.z);
+            return Status.BUSY;
+        }
+        stepAsideTicks = 0;
         // Bounded, because ENSURE_CONTAINER sends us back here whenever the spot is still air. A
         // placement that silently does nothing would otherwise loop between the two phases forever,
         // and advance() resets the phase timer each time so the timeout would never fire.
@@ -578,6 +593,26 @@ public final class DepositCycle {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    /**
+     * Walks directly away from a column so the bot stops occupying it.
+     *
+     * <p>If the bot is exactly on the column's centre line there is no "away" direction to compute,
+     * so it just picks one - any direction gets it out of the block, which is all this needs to do.
+     */
+    private void stepAsideFrom(final int x, final int z) {
+        final double dx = CACHE.getPlayerCache().getX() - (x + 0.5);
+        final double dz = CACHE.getPlayerCache().getZ() - (z + 0.5);
+        final float yaw = (dx * dx + dz * dz) < 1.0E-4
+            ? 0f
+            : RotationHelper.yawToXZ(CACHE.getPlayerCache().getX() + dx, CACHE.getPlayerCache().getZ() + dz);
+        INPUTS.submit(InputRequest.builder()
+            .owner(owner)
+            .input(Input.builder().pressingForward(true).build())
+            .yaw(yaw)
+            .priority(Baritone.getPriority() + 100)
+            .build());
+    }
 
     private void click(final int containerId, final int slot, final AutoAmethystConfig.Deposit cfg) {
         INVENTORY.submit(InventoryActionRequest.builder()

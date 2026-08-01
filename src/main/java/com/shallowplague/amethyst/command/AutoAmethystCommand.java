@@ -198,22 +198,24 @@ public class AutoAmethystCommand extends Command {
                         c.getSource().getEmbed().title("Not connected").errorColor();
                         return ERROR;
                     }
-                    final int x = MathHelper.floorI(CACHE.getPlayerCache().getX());
-                    final int y = MathHelper.floorI(CACHE.getPlayerCache().getY());
-                    final int z = MathHelper.floorI(CACHE.getPlayerCache().getZ());
-                    if (!HarvestPolicy.isSafeToPlaceAt(x, y, z)
-                        && !HarvestPolicy.isShulkerBlock(World.getBlock(x, y, z))) {
+                    // Deliberately NOT the bot's own feet block. The bot has to stand next to the
+                    // deposit spot to use it, and Zenith refuses to place into a block occupied by
+                    // anything that blocks building - including the bot - so a deposit position set
+                    // to where the bot is standing can never be placed into. It logs "an entity is
+                    // blocking the place position" and stops, permanently.
+                    final int[] spot = findDepositSpotNearby();
+                    if (spot == null) {
                         c.getSource().getEmbed()
-                            .title("Unsafe deposit position")
-                            .description("That spot is either not clear, or it sits on a growth face of a "
-                                + "budding amethyst. Placing there would permanently stop that face growing. "
-                                + "Stand somewhere clear of the geode and try again.")
+                            .title("No usable deposit spot here")
+                            .description("Nothing next to you is clear air with a solid floor and clear of "
+                                + "budding amethyst faces. Stand somewhere open, clear of the geode, "
+                                + "and try again.")
                             .errorColor();
                         return ERROR;
                     }
-                    PLUGIN_CONFIG.deposit.x = x;
-                    PLUGIN_CONFIG.deposit.y = y;
-                    PLUGIN_CONFIG.deposit.z = z;
+                    PLUGIN_CONFIG.deposit.x = spot[0];
+                    PLUGIN_CONFIG.deposit.y = spot[1];
+                    PLUGIN_CONFIG.deposit.z = spot[2];
                     PLUGIN_CONFIG.deposit.posSet = true;
                     module().requestReload();
                     c.getSource().getEmbed()
@@ -481,6 +483,41 @@ public class AutoAmethystCommand extends Command {
             }
         }
         return best;
+    }
+
+    /**
+     * Picks a deposit spot next to the bot: clear air, with something solid under it to place
+     * against, safe with respect to budding amethyst faces, and not the block the bot occupies.
+     *
+     * <p>Deliberately never the bot's own feet block. The bot has to stand next to the deposit spot
+     * to use it, and Zenith refuses to place into a block occupied by anything that blocks building
+     * - the bot included - so a deposit position set to where the bot stands can never be placed
+     * into. It logs "an entity is blocking the place position" and stops, permanently.
+     *
+     * <p>Searches the ring at foot level first, then one block out, then a block lower, so the
+     * shulker ends up within easy reach of where the user is standing.
+     */
+    private static int @Nullable [] findDepositSpotNearby() {
+        final int px = MathHelper.floorI(CACHE.getPlayerCache().getX());
+        final int py = MathHelper.floorI(CACHE.getPlayerCache().getY());
+        final int pz = MathHelper.floorI(CACHE.getPlayerCache().getZ());
+        for (int radius = 1; radius <= 2; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
+                    final int x = px + dx, z = pz + dz;
+                    for (int dy = 0; dy >= -1; dy--) {
+                        final int y = py + dy;
+                        if (HarvestPolicy.selfOccupies(x, y, z)) continue;
+                        if (!HarvestPolicy.isSafeToPlaceAt(x, y, z)) continue;
+                        // needs something solid beneath to place against
+                        if (World.getBlock(x, y - 1, z).isAir()) continue;
+                        return new int[]{x, y, z};
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     private static String currentBlockPosString() {

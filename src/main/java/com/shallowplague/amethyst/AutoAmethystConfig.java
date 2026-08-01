@@ -141,6 +141,16 @@ public class AutoAmethystConfig {
 
         /** Pause harvesting when no usable pickaxe is left rather than breaking barehanded. */
         public boolean pauseWhenNoTool = true;
+
+        /**
+         * How long the "no usable pickaxe" condition must hold before it pauses the farm.
+         *
+         * <p>A pause is sticky and needs a manual resume, so it must not be reachable from a
+         * momentary desync. The inventory cache reads empty on connect, on a world change and for
+         * the whole 2b2t queue, and pausing on the first such tick switched the farm off for hours
+         * while the bot was carrying a perfectly good Fortune III pickaxe.
+         */
+        public int noToolGraceTicks = 200;
     }
 
     public final Movement movement = new Movement();
@@ -221,8 +231,15 @@ public class AutoAmethystConfig {
          */
         public double maxDistance = 6.0;
 
+        /**
+         * How close a drop must be to be worth grabbing while there are still clusters in reach.
+         * Anything further waits until the bot has nothing to break, so collection can never starve
+         * harvesting. 0 means never interrupt harvesting to collect.
+         */
+        public double opportunisticRadius = 3.0;
+
         /** Give up on one drop after this long. */
-        public int chaseTimeoutTicks = 120;
+        public int chaseTimeoutTicks = 80;
 
         /** Ticks of no measurable movement before a chase is considered stuck. */
         public int stuckTicks = 40;
