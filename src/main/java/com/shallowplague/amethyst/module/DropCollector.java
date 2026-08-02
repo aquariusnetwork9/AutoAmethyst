@@ -17,8 +17,10 @@ import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Predicate;
 
 import static com.zenith.Globals.BARITONE;
@@ -84,8 +86,18 @@ public final class DropCollector {
                         double ex, double ey, double ez,
                         int amount, double distSq) { }
 
+    /**
+     * How far a forced walk will go, once the pathfinder has declined a drop. Much looser than the
+     * ordinary walk radius: the normal limit exists to stop the bot blundering across the rig when
+     * a planned route was available, and by this point we know one is not.
+     */
+    private static final double FORCED_WALK_RADIUS = 16.0;
+    private static final double FORCED_WALK_HEIGHT = 6.0;
+
     private final Object owner;
     private final List<Drop> visible = new ArrayList<>();
+    /** Drops the pathfinder has given up on, which are now walked at directly whatever the range. */
+    private final Set<Integer> forcedWalk = new HashSet<>();
     /** entity id -> tick at which it may be chased again at all. */
     private final Map<Integer, Long> cooldown = new HashMap<>();
     /** entity id -> tick at which walking straight at it may be tried again. */
@@ -148,9 +160,16 @@ public final class DropCollector {
     public boolean nearestDropNudgeBlocked() {
         return !visible.isEmpty() && nudgeBlocked.containsKey(visible.get(0).id());
     }
+    /** True once the pathfinder has given up on the nearest drop and it is being walked at blind. */
+    public boolean nearestDropForced() {
+        return !visible.isEmpty() && forcedWalk.contains(visible.get(0).id());
+    }
 
     public void reset() {
         stopAll();
+        // Each new collection run starts by trying to plan a route again, rather than inheriting
+        // the last run's conclusion that it had to walk blindly.
+        forcedWalk.clear();
         lastItems = -1;
         failReason = "";
     }
@@ -159,6 +178,7 @@ public final class DropCollector {
     public void clearCooldowns() {
         cooldown.clear();
         nudgeBlocked.clear();
+        forcedWalk.clear();
     }
 
     /**
@@ -209,12 +229,20 @@ public final class DropCollector {
         // give-up rule.
         if (noProgressTicks > Math.max(60, cfg.chaseTimeoutTicks)) {
             final Drop giveUp = visible.get(0);
-            cooldown.put(giveUp.id(), tick + Math.max(20, cfg.retryCooldownTicks));
-            stopAll();
-            failReason = "could not reach a drop in " + noProgressTicks + " ticks, retrying within "
-                + (Math.max(20, cfg.retryCooldownTicks) / 20) + "s";
-            noProgressTicks = 0;
-            lastItems = -1;
+            if (forcedWalk.add(giveUp.id())) {
+                // First failure. Try walking straight at it before writing it off - the pathfinder
+                // declining is exactly the case a blind walk is for.
+                stopPath();
+                noProgressTicks = 0;
+            } else {
+                forcedWalk.remove(giveUp.id());
+                cooldown.put(giveUp.id(), tick + Math.max(20, cfg.retryCooldownTicks));
+                stopAll();
+                failReason = "could not reach a drop in " + noProgressTicks
+                    + " ticks, retrying within " + (Math.max(20, cfg.retryCooldownTicks) / 20) + "s";
+                noProgressTicks = 0;
+                lastItems = -1;
+            }
             return Status.CHASING; // next sweep picks up whatever else is down there
         }
 
@@ -241,6 +269,14 @@ public final class DropCollector {
 
     private boolean withinNudgeRange(final Drop d, final AutoAmethystConfig.Collection cfg) {
         if (nudgeBlocked.containsKey(d.id())) return false;
+        final double ddx = d.ex() - BOT.getX();
+        final double ddz = d.ez() - BOT.getZ();
+        if (forcedWalk.contains(d.id())) {
+            // The pathfinder has already declined this one, so there is no route to lose by
+            // walking at it. Blind is better than abandoned.
+            return Math.sqrt(ddx * ddx + ddz * ddz) <= FORCED_WALK_RADIUS
+                && Math.abs(d.ey() - BOT.getY()) <= FORCED_WALK_HEIGHT;
+        }
         // Hysteresis. Once committed to walking at a drop, keep at it until the walk itself ends.
         // Judging entry and exit by the same threshold made the mode flap between NUDGE and the
         // pathfinder every time the drop drifted across the boundary - and every bounce restarted
@@ -288,13 +324,29 @@ public final class DropCollector {
             markPosition();
         }
 
-        if (++nudgeTicks > Math.max(10, cfg.nudgeTimeoutTicks)
-            || nudgeStuck > Math.max(4, cfg.nudgeStuckTicks)) {
+        final boolean forced = forcedWalk.contains(d.id());
+        // A forced walk may have to cross the rig, so it gets the long budget rather than the short
+        // "just step onto it" one.
+        final int budget = forced
+            ? Math.max(60, cfg.chaseTimeoutTicks)
+            : Math.max(10, cfg.nudgeTimeoutTicks);
+        if (++nudgeTicks > budget || nudgeStuck > Math.max(4, cfg.nudgeStuckTicks)) {
+            mode = Mode.NONE;
+            nudgeTarget = -1;
+            if (forced) {
+                // Last resort already tried. Now it genuinely is unreachable for the moment.
+                forcedWalk.remove(d.id());
+                cooldown.put(d.id(), tick + Math.max(20, cfg.retryCooldownTicks));
+                failReason = "walked at a drop for " + nudgeTicks
+                    + " ticks without reaching it, retrying within "
+                    + (Math.max(20, cfg.retryCooldownTicks) / 20) + "s";
+                nudgeTicks = 0;
+                return Status.FAILED;
+            }
             // Cannot simply walk at it: a wall in the way, a ledge, a shard wedged somewhere. Hand
             // it back to the pathfinder for a while rather than grinding into the obstacle.
             nudgeBlocked.put(d.id(), tick + Math.max(20, cfg.nudgeRetryTicks));
-            mode = Mode.NONE;
-            nudgeTarget = -1;
+            nudgeTicks = 0;
             return Status.CHASING;
         }
 
@@ -364,9 +416,17 @@ public final class DropCollector {
             return Status.CHASING;
         }
 
+        // Both goals failed. Rather than writing the batch off, hand the nearest to a forced direct
+        // walk - "the pathfinder found no route" is the case a blind walk exists for, and inside a
+        // geode it is routine, because it will not stand on budding amethyst. Only a failed walk
+        // puts a drop on the cooldown.
+        stopPath();
+        if (forcedWalk.add(visible.get(0).id())) {
+            noProgressTicks = 0;
+            return Status.CHASING;
+        }
         final long until = tick + Math.max(20, cfg.retryCooldownTicks);
         for (int i = 0; i < n; i++) cooldown.put(visible.get(i).id(), until);
-        stopPath();
         failReason = (noRoute ? "no route to " : "could not get to ") + n + " drop(s), retrying within "
             + (Math.max(20, cfg.retryCooldownTicks) / 20) + "s";
         return Status.FAILED;

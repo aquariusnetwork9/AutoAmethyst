@@ -107,7 +107,15 @@ public class AutoAmethystConfig {
 
         /**
          * Require an unobstructed line of sight to the target before breaking. Zenith's block
-         * target raycast will happily hit a block through a wall; vanilla clients cannot. Leave on.
+         * target raycast will happily hit a block through a wall; vanilla clients cannot.
+         *
+         * <p><b>Leave this on.</b> Besides being the honest thing to send a server, it is what stops
+         * the bot breaking clusters on the level above it through the ceiling - the shards then land
+         * up there, where there is no route to them, and the farm quietly loses everything it just
+         * mined. Turning it off does not make the bot harvest more; it makes it drop more on the
+         * floor. If clusters are being refused for want of a clean shot, the fix is that the bot
+         * needs to walk onto their level, which {@link com.shallowplague.amethyst.module.Travel}
+         * escalates to on its own.
          */
         public boolean requireLineOfSight = true;
 

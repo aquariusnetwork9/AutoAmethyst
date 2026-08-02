@@ -1,6 +1,7 @@
 package com.shallowplague.amethyst.module;
 
 import com.shallowplague.amethyst.AutoAmethystConfig;
+import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
 import com.zenith.feature.pathfinder.goals.GoalNear;
 import com.zenith.mc.block.BlockPos;
 import com.zenith.util.math.MathHelper;
@@ -35,6 +36,7 @@ public final class Travel {
     private int ticks;
     private int repathCooldown;
     private int idleTicks;
+    private boolean tightened;
     private String failReason = "";
 
     public boolean isActive() { return active; }
@@ -49,8 +51,31 @@ public final class Travel {
         ticks = 0;
         repathCooldown = 0;
         idleTicks = 0;
+        tightened = false;
         failReason = "";
         active = true;
+    }
+
+    /**
+     * Asks for a closer stand position after arriving without a clean shot at the target.
+     *
+     * <p>The first goal is a {@link GoalNear} sized to interaction reach, and that range is a
+     * <b>three-dimensional</b> distance - so standing one floor below a cluster satisfies it
+     * completely. The bot then has the cluster in range but a ceiling in the way, which with line of
+     * sight required means it can never break it, and without line of sight required means it breaks
+     * it through the floor and the shards land on a level it has no route to. Either way the answer
+     * is to go up and stand next to the thing, which is what {@link GoalGetToBlock} demands.
+     *
+     * @return false if this leg has already been tightened, so the caller should give up on it
+     */
+    public boolean tighten() {
+        if (!active || tightened) return false;
+        tightened = true;
+        if (BARITONE.isActive()) BARITONE.stop();
+        ticks = 0;
+        repathCooldown = 0;
+        idleTicks = 0;
+        return true;
     }
 
     public void stop() {
@@ -68,9 +93,16 @@ public final class Travel {
         if (!active) return Status.ARRIVED;
 
         final double dist = distanceToTarget();
-        if (dist <= arriveDistance) {
+        // Once tightened, being merely within reach is what already failed, so distance alone no
+        // longer counts as arrival - the caller's line-of-sight test decides, and the pathfinder is
+        // left to finish getting beside the block.
+        if (dist <= arriveDistance && !tightened) {
             stop();
             return Status.ARRIVED;
+        }
+        if (tightened && !BARITONE.isActive() && repathCooldown <= 0 && idleTicks > 3) {
+            stop();
+            return Status.ARRIVED; // as close as it is going to get
         }
         if (dist > cfg.maxTravelDistance) {
             return fail("target is " + (int) dist + " blocks away, past the travel limit");
@@ -85,12 +117,17 @@ public final class Travel {
             // Not moving and not planning. Either we have not asked yet, or the last request came
             // back with no route. Ask again a bounded number of times, then give up on this target
             // rather than standing here - the caller blacklists it and moves to the next one.
-            if (++idleTicks > 3) {
+            if (++idleTicks > 3 && !tightened) {
                 return fail("no route (the pathfinder cannot reach it without breaking blocks)");
             }
-            // rangeSq sized to interaction reach: stand near enough to touch it, not on it.
-            final int rangeSq = Math.max(2, (int) Math.pow(BOT.getBlockReachDistance() - 1, 2));
-            BARITONE.pathTo(new GoalNear(new BlockPos(targetX, targetY, targetZ), rangeSq));
+            if (tightened) {
+                // Get beside the block, on its own level, rather than merely within reach of it.
+                BARITONE.pathTo(new GoalGetToBlock(new BlockPos(targetX, targetY, targetZ)));
+            } else {
+                // rangeSq sized to interaction reach: stand near enough to touch it, not on it.
+                final int rangeSq = Math.max(2, (int) Math.pow(BOT.getBlockReachDistance() - 1, 2));
+                BARITONE.pathTo(new GoalNear(new BlockPos(targetX, targetY, targetZ), rangeSq));
+            }
             repathCooldown = REPATH_COOLDOWN_TICKS;
         } else {
             idleTicks = 0;

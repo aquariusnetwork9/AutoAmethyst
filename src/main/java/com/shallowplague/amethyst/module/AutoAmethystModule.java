@@ -427,10 +427,17 @@ public class AutoAmethystModule extends Module {
                 if (inReachWithSight(x, y, z)) {
                     breaker.begin(x, y, z);
                     state = State.ENGAGE;
+                } else if (travel.tighten()) {
+                    // In range but no clean shot - almost always a floor in the way, because the
+                    // arrival range is a 3D distance and standing one level below satisfies it.
+                    // Ask to be put beside the cluster instead of merely near it. This is what
+                    // stops the bot breaking clusters through a ceiling and then having no route
+                    // to the shards it just dropped on the level above.
+                    debug("In range but no line of sight, moving onto the cluster's level");
                 } else {
-                    // Close, but no clean shot from where the pathfinder put us. Park it on the
-                    // skip cooldown and move to the next one rather than shuffling about.
-                    skipTarget(currentTarget, "arrived but still no clean line of sight");
+                    // Even standing beside it there is no clean shot. Park it and move on rather
+                    // than shuffling about.
+                    skipTarget(currentTarget, "no clean line of sight even from beside it");
                 }
             }
             case FAILED -> skipTarget(currentTarget, travel.failReason());
@@ -1016,7 +1023,8 @@ public class AutoAmethystModule extends Module {
                                          collector.nearestDropZ())),
                 collector.nearestDropNudgeBlocked(), collector.noProgressTicks()));
             out.add("direct walk: " + collector.nudgeTicks() + " ticks, "
-                + collector.nudgeStuckTicks() + " of them with no movement");
+                + collector.nudgeStuckTicks() + " of them with no movement"
+                + (collector.nearestDropForced() ? "  (FORCED - pathfinder gave up on it)" : ""));
         }
         out.add("collection=" + (PLUGIN_CONFIG.collection.enabled ? "on" : "off")
             + "  deposit=" + (PLUGIN_CONFIG.deposit.enabled ? "on" : "off")
