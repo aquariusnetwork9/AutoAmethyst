@@ -130,6 +130,19 @@ public class AutoAmethystConfig {
         public int skipCooldownTicks = 600;
 
         /**
+         * Ticks a target the bot physically could not get to stays blacklisted. Far longer than
+         * {@link #skipCooldownTicks}, which is meant for transient problems.
+         *
+         * <p>Some clusters in a real rig simply cannot be reached or seen from anywhere the bot can
+         * stand - walled in, or on a face the pathfinder has no route to. Retrying those on the
+         * ordinary 30 second cooldown means the bot spends its whole life walking to clusters it is
+         * about to give up on again, which is what "it won't even follow its own path" looks like
+         * from outside. Nothing is lost by waiting: a cluster face takes about 2h17m to regrow, so
+         * checking an awkward one every ten minutes still catches it long before it matters.
+         */
+        public int unreachableCooldownTicks = 2400;
+
+        /**
          * Ticks after an apparent break during which a reappearing cluster at the same position is
          * counted as an anticheat revert rather than new growth. Real regrowth takes ~34 minutes
          * per stage so anything inside a few seconds is a revert.

@@ -152,6 +152,16 @@ public class AutoAmethystCommand extends Command {
             // has, and the proxy rewrites that file from memory on shutdown - so editing the JSON
             // and restarting silently reverts, and changing the Java default does nothing at all to
             // a bot that has already run once.
+            .then(literal("skipfor").then(argument("ticks", integer(20)).executes(c -> {
+                PLUGIN_CONFIG.harvest.unreachableCooldownTicks = getInteger(c, "ticks");
+                c.getSource().getEmbed()
+                    .title("Unreachable cooldown set")
+                    .description("A cluster the bot could not get to or see is left alone for "
+                        + (PLUGIN_CONFIG.harvest.unreachableCooldownTicks / 20) + "s. Growth is "
+                        + "~2h17m per face, so waiting costs nothing - but too long parks a rig "
+                        + "whose clusters are actually fine.")
+                    .primaryColor();
+            })))
             .then(literal("walk")
                 .then(literal("radius").then(argument("blocks", doubleArg(1.0, 12.0)).executes(c -> {
                     PLUGIN_CONFIG.collection.nudgeRadius = getDouble(c, "blocks");

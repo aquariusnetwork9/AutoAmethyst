@@ -76,7 +76,7 @@ public class AutoAmethystModule extends Module {
     private enum State { IDLE, TRAVEL, ENGAGE, SETTLE, COLLECTING, DEPOSITING, GOING_HOME }
 
     private final Timer scanTimer = Timers.tickTimer();
-    private final Travel travel = new Travel();
+    private final Travel travel = new Travel(this);
     private final BreakDriver breaker = new BreakDriver();
     private final DropCollector collector = new DropCollector(this);
     private final DepositCycle depositCycle = new DepositCycle(this);
@@ -102,8 +102,22 @@ public class AutoAmethystModule extends Module {
     private final Map<Long, Long> skipUntil = new HashMap<>();
     /** pos -> tick at which we believed we broke it, for anticheat revert detection. */
     private final Map<Long, Long> recentlyBroken = new HashMap<>();
+    /**
+     * Clusters the bot could not get to or see from anywhere it can stand. Reported by {@code why}
+     * so a rig with genuinely unreachable clusters looks different from a bot that is misbehaving.
+     */
+    private final java.util.Set<Long> unreachableTargets = new java.util.HashSet<>();
+
+    /** Ticks to leave the parking spot alone after a home leg that did not settle cleanly. */
+    private static final int HOME_RETRY_TICKS = 400;
+    /** Horizontal cells either side searched for a position with a clean shot at a cluster. */
+    private static final int STAND_SEARCH_RADIUS = 3;
 
     private long tickCounter = 0;
+    /** Tick before which no new home leg may start, so parking cannot become a walk-stop loop. */
+    private long homeRetryAfter = 0;
+    /** Target the stand-cell solver has already been run for, so it runs once per engagement. */
+    private long standSolvedFor = Long.MIN_VALUE;
     private int settleTicks = 0;
     private int toolWaitTicks = 0;
     /** Consecutive ticks with no usable pickaxe, so a momentary desync cannot latch a pause. */
@@ -216,6 +230,7 @@ public class AutoAmethystModule extends Module {
         travel.stop();
         skipUntil.clear();
         recentlyBroken.clear();
+        unreachableTargets.clear();
         breaker.reset();
         collector.reset();
         depositCycle.reset();
@@ -380,6 +395,7 @@ public class AutoAmethystModule extends Module {
             return;
         }
         currentTarget = pos;
+        standSolvedFor = Long.MIN_VALUE; // a fresh engagement gets a fresh solve
         final int x = BlockPos.getX(pos), y = BlockPos.getY(pos), z = BlockPos.getZ(pos);
         if (inReachWithSight(x, y, z)) {
             breaker.begin(x, y, z);
@@ -420,24 +436,36 @@ public class AutoAmethystModule extends Module {
         }
 
         // Arrive a little inside reach so the line-of-sight check has room to succeed.
-        final Travel.Status status = travel.tick(PLUGIN_CONFIG.movement, effectiveReach() - 0.5);
+        final Travel.Status status = travel.tick(
+            PLUGIN_CONFIG.movement, effectiveReach() - 0.5, harvest().inputPriority);
         switch (status) {
             case BUSY -> { }
             case ARRIVED -> {
                 if (inReachWithSight(x, y, z)) {
                     breaker.begin(x, y, z);
                     state = State.ENGAGE;
-                } else if (travel.tighten()) {
-                    // In range but no clean shot - almost always a floor in the way, because the
-                    // arrival range is a 3D distance and standing one level below satisfies it.
-                    // Ask to be put beside the cluster instead of merely near it. This is what
-                    // stops the bot breaking clusters through a ceiling and then having no route
-                    // to the shards it just dropped on the level above.
-                    debug("In range but no line of sight, moving onto the cluster's level");
+                } else if (currentTarget != standSolvedFor) {
+                    // In range but no clean shot - usually a floor in the way, because the arrival
+                    // range is a 3D distance and standing one level below satisfies it completely.
+                    // Rather than asking the pathfinder to "get closer" and hoping, work out which
+                    // cell actually has a clean shot and go and stand in it.
+                    standSolvedFor = currentTarget;
+                    final BlockPos cell = StandCell.find(x, y, z, effectiveReach(),
+                        harvest().requireLineOfSight, STAND_SEARCH_RADIUS, 2, 1);
+                    if (cell == null) {
+                        skipTarget(currentTarget, "no stand position anywhere has a clean shot at it");
+                    } else if (cell.x() == MathHelper.floorI(BOT.getX())
+                        && cell.y() == MathHelper.floorI(BOT.getY())
+                        && cell.z() == MathHelper.floorI(BOT.getZ())) {
+                        // Already in the only cell that works, yet the shot still fails from where
+                        // we actually are inside it. Nothing further to try.
+                        skipTarget(currentTarget, "standing in the only cell with a shot, and it still misses");
+                    } else {
+                        debug("No shot from here; walking to the stand cell that has one");
+                        travel.beginStand(cell.x(), cell.y(), cell.z());
+                    }
                 } else {
-                    // Even standing beside it there is no clean shot. Park it and move on rather
-                    // than shuffling about.
-                    skipTarget(currentTarget, "no clean line of sight even from beside it");
+                    skipTarget(currentTarget, "no clean line of sight even from its stand cell");
                 }
             }
             case FAILED -> skipTarget(currentTarget, travel.failReason());
@@ -565,8 +593,12 @@ public class AutoAmethystModule extends Module {
 
     /** Walking back to the parking spot, if one is configured. Never fatal. */
     private void tickGoingHome() {
+        // Travel measures from the EYE while goHomeIfIdle measures from the FEET, and the eye sits
+        // 1.62 blocks higher - so handing Travel the raw tolerance leaves an annulus where Travel
+        // reports ARRIVED and goHomeIfIdle immediately decides we are not home yet, re-arming the
+        // leg forever. Give Travel a strictly looser test than the one that re-arms it.
         final Travel.Status status = travel.tick(
-            PLUGIN_CONFIG.movement, Math.max(2.0, PLUGIN_CONFIG.movement.homeTolerance));
+            PLUGIN_CONFIG.movement, homeTolerance() + 1.8, harvest().inputPriority);
         switch (status) {
             case BUSY -> { }
             case ARRIVED, FAILED -> {
@@ -575,6 +607,10 @@ public class AutoAmethystModule extends Module {
                 if (status == Travel.Status.FAILED) {
                     debug("Could not get home: {}", travel.failReason());
                 }
+                // Whatever happened, do not immediately try again. Parking is a nicety; a home spot
+                // the bot cannot quite reach must never turn into a walk-stop-walk loop that eats
+                // every tick the farm has.
+                homeRetryAfter = tickCounter + HOME_RETRY_TICKS;
                 setAnchorHere();
                 state = State.IDLE;
             }
@@ -585,11 +621,16 @@ public class AutoAmethystModule extends Module {
     private void goHomeIfIdle() {
         final AutoAmethystConfig.Movement cfg = PLUGIN_CONFIG.movement;
         if (!cfg.returnHome || !cfg.homeSet) return;
+        if (tickCounter < homeRetryAfter) return;
         final double dist = MathHelper.distance3d(
             cfg.homeX + 0.5, cfg.homeY + 0.5, cfg.homeZ + 0.5, BOT.getX(), BOT.getY(), BOT.getZ());
-        if (dist <= Math.max(2.0, cfg.homeTolerance)) return;
+        if (dist <= homeTolerance()) return;
         travel.begin(cfg.homeX, cfg.homeY, cfg.homeZ);
         state = State.GOING_HOME;
+    }
+
+    private double homeTolerance() {
+        return Math.max(2.0, PLUGIN_CONFIG.movement.homeTolerance);
     }
 
     // ------------------------------------------------------------------ deposit trigger
@@ -735,6 +776,9 @@ public class AutoAmethystModule extends Module {
         consecutiveFailures = 0;
         recentlyBroken.put(pos, tickCounter);
         matureTargets.rem(pos);
+        // It was reachable after all - the bot may simply have been standing somewhere better this
+        // time, so do not keep reporting it as a permanent hole in the rig.
+        unreachableTargets.remove(pos);
         // Anchor the collector where the bot was standing when it broke this, so the leash is
         // centred on where the shards actually landed rather than on some earlier position.
         setAnchorHere();
@@ -779,12 +823,26 @@ public class AutoAmethystModule extends Module {
         return false;
     }
 
-    /** Target is bad; blacklist it for a while so the loop cannot spin on it. */
+    /**
+     * Target is bad; blacklist it for a while so the loop cannot spin on it.
+     *
+     * <p>A target the bot physically could not get to or see is parked for much longer than one it
+     * merely failed at this time. Retrying a structurally unreachable cluster every thirty seconds
+     * means the bot spends its life walking to clusters it is about to abandon again, which reads
+     * from outside as the pathfinder refusing to follow its own routes.
+     */
     private void skipTarget(final long pos, final String reason) {
         skipped++;
-        skipUntil.put(pos, tickCounter + Math.max(20, harvest().skipCooldownTicks));
+        final boolean unreachable = reason.contains("no route")
+            || reason.contains("even from beside it")
+            || reason.contains("out of reach");
+        final int cooldown = unreachable
+            ? Math.max(20, harvest().unreachableCooldownTicks)
+            : Math.max(20, harvest().skipCooldownTicks);
+        if (unreachable) unreachableTargets.add(pos);
+        skipUntil.put(pos, tickCounter + cooldown);
         matureTargets.rem(pos);
-        warn("Skipping {}: {}", describe(pos), reason);
+        warn("Skipping {} for {}s: {}", describe(pos), cooldown / 20, reason);
         releaseBreak();
         scanTimer.skip();
         state = State.IDLE;
@@ -1022,6 +1080,12 @@ public class AutoAmethystModule extends Module {
         out.add("ripe in box=" + matureInBox + (scanReliable ? "" : " (UNRELIABLE - box chunks unloaded)")
             + "  targets queued=" + matureTargets.size()
             + "  waiting for " + Math.max(1, harvest().minMatureToHarvest));
+        if (!unreachableTargets.isEmpty()) {
+            out.add("unreachable clusters parked: " + unreachableTargets.size()
+                + " (no route, or no clean shot from anywhere the bot can stand). These are a "
+                + "property of the rig, not a fault - they retry every "
+                + (Math.max(20, harvest().unreachableCooldownTicks) / 20) + "s.");
+        }
         out.add("rejected since last scan: too far=" + diagRejectedFar
             + "  on cooldown=" + diagRejectedSkipped
             + "  no line of sight=" + diagRejectedNoLos);

@@ -457,9 +457,14 @@ public final class DropCollector {
      * A drop that has genuinely rolled a block is close enough for the hand walk anyway.
      */
     private long signature(final int n) {
-        long h = 1125899906842597L;
+        // ORDER-INDEPENDENT, and that matters as much as leaving positions out. `visible` is
+        // re-sorted by distance from the bot every tick, so while the bot is walking any two drops
+        // can swap rank - which changed a positional hash, re-issued the goal, and produced a fresh
+        // "Calculated path to goal" up to twice a second. That log line means a COMPLETE path was
+        // found, so repeats of it are external re-requests, not the pathfinder struggling.
+        long h = 0;
         for (int i = 0; i < n; i++) {
-            h = h * 31 + visible.get(i).id();
+            h ^= Long.hashCode(visible.get(i).id() * 0x9E3779B97F4A7C15L);
         }
         return h;
     }

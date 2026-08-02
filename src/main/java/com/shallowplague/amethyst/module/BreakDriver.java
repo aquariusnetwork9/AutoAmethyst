@@ -171,12 +171,28 @@ public final class BreakDriver {
      */
     public static boolean canEngage(final int x, final int y, final int z, final Vector2f rot,
                                     final double reach, final boolean requireLineOfSight) {
-        final BlockRaycastResult through =
-            RaycastHelper.playerEyeRaycastThroughToBlockTarget(x, y, z, rot.getX(), rot.getY(), reach);
+        return canEngage(x, y, z, BOT.getX(), BOT.getEyeY(), BOT.getZ(), rot, reach, requireLineOfSight);
+    }
+
+    /**
+     * The same test from an arbitrary eye position, so a stand position can be evaluated
+     * <i>before</i> walking to it.
+     *
+     * <p>This is what lets the module answer "where would I have to stand to break this?" instead
+     * of only ever "can I break it from here?". Without it the sole remedy for an occluded cluster
+     * was to ask the pathfinder to get closer and hope, which inside a geode routinely cannot be
+     * satisfied at all.
+     */
+    public static boolean canEngage(final int x, final int y, final int z,
+                                    final double eyeX, final double eyeY, final double eyeZ,
+                                    final Vector2f rot, final double reach,
+                                    final boolean requireLineOfSight) {
+        final BlockRaycastResult through = RaycastHelper.blockRaycastThroughToBlockTarget(
+            x, y, z, eyeX, eyeY, eyeZ, rot.getX(), rot.getY(), reach);
         if (!through.hit() || through.x() != x || through.y() != y || through.z() != z) return false;
         if (!requireLineOfSight) return true;
         final BlockRaycastResult first = RaycastHelper.blockRaycastFromPos(
-            BOT.getX(), BOT.getEyeY(), BOT.getZ(), rot.getX(), rot.getY(), reach, false);
+            eyeX, eyeY, eyeZ, rot.getX(), rot.getY(), reach, false);
         if (!first.hit()) return true; // nothing at all in the way
         if (first.x() == x && first.y() == y && first.z() == z) return true;
 
