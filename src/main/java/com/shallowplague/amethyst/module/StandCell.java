@@ -66,7 +66,11 @@ public final class StandCell {
                     if (distSq > reachSq || distSq >= bestDistSq) continue;
                     if (!standable(fx, fy, fz)) continue;
 
-                    final Vector2f rot = RotationHelper.rotationTo(ex, ey, ez, centre.x(), centre.y(), centre.z());
+                    // TARGET first, then source. RotationHelper.rotationTo(a,b,c,d,e,f) computes
+                    // dx = a - d, so passing the eye first aims the ray 180 degrees away from the
+                    // block and every candidate cell then reports "no clean shot".
+                    final Vector2f rot = RotationHelper.rotationTo(
+                        centre.x(), centre.y(), centre.z(), ex, ey, ez);
                     if (!BreakDriver.canEngage(tx, ty, tz, ex, ey, ez, rot, reach, requireLineOfSight)) continue;
 
                     bestDistSq = distSq;

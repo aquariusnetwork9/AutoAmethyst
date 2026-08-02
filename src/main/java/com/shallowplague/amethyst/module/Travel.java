@@ -62,6 +62,8 @@ public final class Travel {
     /** Ticks of no movement during a hand walk before calling it blocked. */
     private static final int DIRECT_STUCK_TICKS = 12;
     private static final double MOVED_EPSILON_SQ = 0.0025; // 0.05 blocks
+    /** Ticks of no movement at all before a leg is treated as wedged, whatever the pathfinder says. */
+    private static final int WEDGED_TICKS = 50;
 
     private final Object owner;
 
@@ -75,6 +77,8 @@ public final class Travel {
     private boolean direct;
     private int directTicks;
     private int directStuck;
+    /** Ticks with no movement while the pathfinder claims to be working. */
+    private int stuckTicks;
     private double lastX, lastY, lastZ;
     private @Nullable Goal currentGoal;
     private String failReason = "";
@@ -113,6 +117,8 @@ public final class Travel {
         direct = false;
         directTicks = 0;
         directStuck = 0;
+        stuckTicks = 0;
+        markPosition();
         currentGoal = null;
         failReason = "";
     }
@@ -149,6 +155,30 @@ public final class Travel {
         }
         if (++ticks > Math.max(100, cfg.legTimeoutTicks)) {
             return fail("could not get there in " + ticks + " ticks");
+        }
+
+        // Wedged. The bot snags on amethyst buds constantly - they have collision but the planner
+        // does not treat them as obstacles it must route around - and while it is stuck the
+        // pathfinder still reports isActive(), so every other exit here is disarmed and the leg
+        // used to sit there for the full 600 tick timeout. Judge by whether the bot has actually
+        // moved, which is the one thing that cannot be faked.
+        if (!direct) {
+            if (MathHelper.distanceSq3d(BOT.getX(), BOT.getY(), BOT.getZ(), lastX, lastY, lastZ)
+                < MOVED_EPSILON_SQ) {
+                stuckTicks++;
+            } else {
+                stuckTicks = 0;
+            }
+            markPosition();
+            if (stuckTicks > WEDGED_TICKS) {
+                // Walking at it by hand clears a bud the planner will not route around. For a leg
+                // that is only trying to get near something, give up and let the caller re-choose.
+                if (standMode) {
+                    beginDirect();
+                    return Status.BUSY;
+                }
+                return fail("wedged for " + stuckTicks + " ticks without moving");
+            }
         }
 
         if (direct) return walkDirectly(cfg, priority);

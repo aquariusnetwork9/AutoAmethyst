@@ -473,6 +473,12 @@ public class AutoAmethystModule extends Module {
     }
 
     private void tickEngage() {
+        // Stand still to mine. The interaction manager keys destroy progress on the target AND the
+        // rotation, so a bot still drifting - because a path was left running, or the collector's
+        // walk has not been released - re-aims fractionally every tick, loses its progress, and
+        // swings forever without the block ever breaking. Cheap to enforce, and it costs nothing
+        // when nothing is running.
+        travel.stop();
         final long pos = breaker.target();
         final BreakDriver.Status status = breaker.tick(
             this::isHarvestable, effectiveReach(), harvest().requireLineOfSight,
