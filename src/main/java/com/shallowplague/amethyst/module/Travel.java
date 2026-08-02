@@ -69,12 +69,17 @@ public final class Travel {
      * @return false if this leg has already been tightened, so the caller should give up on it
      */
     public boolean tighten() {
-        if (!active || tightened) return false;
+        // Deliberately does NOT require the leg to still be active. It is called straight after a
+        // tick returned ARRIVED, and arriving calls stop(), which clears that flag - so checking it
+        // here made tighten() refuse every single time and the caller skipped the cluster within a
+        // couple of seconds. The target is still held, so the leg can simply be re-armed.
+        if (tightened) return false;
         tightened = true;
         if (BARITONE.isActive()) BARITONE.stop();
         ticks = 0;
         repathCooldown = 0;
         idleTicks = 0;
+        active = true;
         return true;
     }
 

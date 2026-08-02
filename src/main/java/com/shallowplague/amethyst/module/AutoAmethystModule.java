@@ -455,7 +455,15 @@ public class AutoAmethystModule extends Module {
             case BROKEN -> onBreakSucceeded(pos);
             case BLOCKED -> {
                 final String reason = breaker.blockedReason();
-                if (reason.contains("no progress")) {
+                // Anything that is a property of THIS target must put it on the skip cooldown, or
+                // the next scan picks the same cluster straight back up, fails identically, and
+                // burns the whole consecutive-failure budget in a couple of seconds. That is
+                // exactly how the farm paused itself with several clusters ripe: "out of reach or
+                // no line of sight" went to abandonTarget, which applies no cooldown at all.
+                if (reason.contains("no progress")
+                    || reason.contains("out of reach")
+                    || reason.contains("not on the allowlist")
+                    || reason.contains("chunk unloaded")) {
                     skipTarget(pos, reason);
                 } else {
                     abandonTarget(reason);
@@ -740,11 +748,35 @@ public class AutoAmethystModule extends Module {
         debug("Abandoned target: {}", reason);
         releaseBreak();
         if (++consecutiveFailures >= Math.max(1, harvest().maxConsecutiveFailures)) {
+            // Pausing is sticky and needs a manual resume, so it is only ever the right answer when
+            // there is genuinely nothing else to try. One awkward cluster is not a reason to stop a
+            // farm that has others ripe and reachable - and every skipped target comes back round
+            // when its cooldown expires anyway.
+            if (hasOtherTargets()) {
+                debug("Failure budget spent on one target, moving to another instead of pausing");
+                consecutiveFailures = 0;
+                skipTarget(currentTarget, reason);
+                return;
+            }
             pause("gave up after " + consecutiveFailures + " consecutive failed targets (last: " + reason + ")");
             return;
         }
         scanTimer.skip();
         state = State.IDLE;
+    }
+
+    /** True when some cluster other than the current target is ripe, off cooldown and loaded. */
+    private boolean hasOtherTargets() {
+        final LongIterator it = matureTargets.iterator();
+        while (it.hasNext()) {
+            final long pos = it.nextLong();
+            if (pos == currentTarget) continue;
+            if (isSkipped(pos)) continue;
+            final int x = BlockPos.getX(pos), y = BlockPos.getY(pos), z = BlockPos.getZ(pos);
+            if (!World.isChunkLoadedBlockPos(x, z)) continue;
+            if (isHarvestable(World.getBlock(x, y, z))) return true;
+        }
+        return false;
     }
 
     /** Target is bad; blacklist it for a while so the loop cannot spin on it. */

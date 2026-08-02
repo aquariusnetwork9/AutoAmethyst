@@ -48,9 +48,19 @@ public final class BreakDriver {
         BLOCKED
     }
 
+    /**
+     * Ticks a target may be out of reach or out of sight before the break is given up on. Covers
+     * the bot still decelerating after the pathfinder has parked it, and the rotation gate - the
+     * engine's interaction tick runs before the requested yaw is committed, so the first tick of a
+     * new target only turns.
+     */
+    private static final int ENGAGE_SETTLE_TICKS = 20;
+
     private boolean active = false;
     private long target = 0;
     private int ticks = 0;
+    /** Consecutive ticks the target has been unreachable within this one break attempt. */
+    private int engageFailTicks = 0;
     private String blockedReason = "";
 
     public boolean isActive() { return active; }
@@ -61,6 +71,7 @@ public final class BreakDriver {
     public void begin(final int x, final int y, final int z) {
         target = BlockPos.asLong(x, y, z);
         ticks = 0;
+        engageFailTicks = 0;
         active = true;
         blockedReason = "";
     }
@@ -69,6 +80,7 @@ public final class BreakDriver {
         active = false;
         target = 0;
         ticks = 0;
+        engageFailTicks = 0;
         blockedReason = "";
     }
 
@@ -122,7 +134,16 @@ public final class BreakDriver {
 
         final Position center = World.blockInteractionCenter(x, y, z);
         final Vector2f rot = RotationHelper.rotationTo(center.x(), center.y(), center.z());
-        if (!canEngage(x, y, z, rot, reach, requireLineOfSight)) return blocked("out of reach or no line of sight");
+        if (!canEngage(x, y, z, rot, reach, requireLineOfSight)) {
+            // Not immediately fatal. The caller only decides to engage once, a tick earlier, and
+            // the bot is often still gliding to a stop when the break starts - so a target right at
+            // the edge of reach fails on the first tick and would be given up on before it had
+            // stood still. Tolerate a short settling window; a target that never comes into view
+            // still ends up blocked, just with an accurate reason.
+            if (++engageFailTicks <= ENGAGE_SETTLE_TICKS) return Status.BUSY;
+            return blocked("out of reach or no line of sight");
+        }
+        engageFailTicks = 0;
 
         INPUTS.submit(InputRequest.builder()
             .owner(this)
