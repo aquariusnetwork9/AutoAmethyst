@@ -3,6 +3,8 @@ package com.shallowplague.amethyst.module;
 import com.shallowplague.amethyst.AutoAmethystConfig;
 import com.zenith.mc.block.Block;
 import com.zenith.mc.block.BlockRegistry;
+import com.zenith.mc.block.CollisionBox;
+import com.zenith.mc.block.LocalizedCollisionBox;
 import com.zenith.mc.block.BlockTags;
 import com.zenith.feature.player.World;
 import com.zenith.util.math.MathHelper;
@@ -139,12 +141,25 @@ public final class HarvestPolicy {
      * nothing about the position ever changes.
      */
     public static boolean selfOccupies(final int x, final int y, final int z) {
-        final int bx = MathHelper.floorI(BOT.getX());
-        final int by = MathHelper.floorI(BOT.getY());
-        final int bz = MathHelper.floorI(BOT.getZ());
-        // the player is a bit under two blocks tall, so it fills its feet block and the one above
-        return bx == x && bz == z && (by == y || by + 1 == y);
+        // A real box overlap, NOT a comparison of block columns. The player box is 0.6 wide, so a
+        // floorI() test flips to "clear" the instant the bot's centre crosses the column boundary
+        // while the box still overlaps the cell by up to 0.3 - and the server refuses any placement
+        // that intersects an entity, silently. That is exactly how "could not place a shulker after
+        // 5 attempts" happened with the bot apparently standing beside the spot: it was standing
+        // beside it by its centre and inside it by its shoulder.
+        //
+        // Upstream's own check (PlaceBlock.entityInPlaceTarget) is the same shape, and
+        // LocalizedCollisionBox.intersects uses >= / <=, so merely touching counts. The margin buys
+        // a little clearance beyond that.
+        return BOT.getPlayerCollisionBox()
+            .inflate(PLACE_CLEARANCE, PLACE_CLEARANCE, PLACE_CLEARANCE)
+            .intersects(new LocalizedCollisionBox(FULL_BLOCK, x, y, z));
     }
+
+    /** Extra clearance demanded between the bot and a block it is about to place. */
+    private static final double PLACE_CLEARANCE = 0.05;
+    /** A whole block, for entity-overlap tests. Components are interleaved: minX,maxX,minY,maxY,minZ,maxZ. */
+    private static final CollisionBox FULL_BLOCK = new CollisionBox(0, 1, 0, 1, 0, 1);
 
     private static final int[][] FACE_OFFSETS = {
         {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}
