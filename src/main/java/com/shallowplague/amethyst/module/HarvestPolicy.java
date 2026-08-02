@@ -205,6 +205,22 @@ public final class HarvestPolicy {
             || name.endsWith("amethyst_bud");
     }
 
+    /**
+     * Any harvested amethyst item, regardless of which mode is running.
+     *
+     * <p>Used to keep the hotbar clear. {@link #isHarvestYield} is mode-specific, but a stray
+     * cluster item picked up while in SHARDS mode still must not be left squatting in a hotbar slot
+     * reserved for a shulker.
+     */
+    public static boolean isAnyAmethystYield(final @Nullable ItemStack stack) {
+        final ItemData data = itemData(stack);
+        if (data == null) return false;
+        final String name = data.name();
+        return data.id() == ItemRegistry.AMETHYST_SHARD.id()
+            || name.endsWith("amethyst_cluster")
+            || name.endsWith("amethyst_bud");
+    }
+
     // ------------------------------------------------------------------ tools
 
     /**

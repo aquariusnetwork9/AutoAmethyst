@@ -5,9 +5,13 @@ import com.zenith.feature.player.RotationHelper;
 import com.zenith.feature.player.World;
 import com.zenith.mc.block.Block;
 import com.zenith.mc.block.BlockPos;
+import com.zenith.mc.block.LocalizedCollisionBox;
 import com.zenith.util.math.MathHelper;
 import org.cloudburstmc.math.vector.Vector2f;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.metadata.Pose;
 import org.jspecify.annotations.Nullable;
+
+import static com.zenith.Globals.BOT;
 
 /**
  * Works out <i>where the bot would have to stand</i> to break a given block.
@@ -81,11 +85,84 @@ public final class StandCell {
         return best;
     }
 
-    /** Whether a player could physically stand with their feet in this cell. */
+    /**
+     * {@code LocalizedCollisionBox.intersects} is INCLUSIVE on every axis, and the block scan is
+     * padded by a cell in each direction, so the floor at {@code y-1} is always tested and always
+     * "touches" a box whose {@code minY} is exactly {@code y}. Without this shrink every cell that
+     * has a floor reads as blocked, the solver returns nothing, and the bot stands still for good.
+     * Zenith never makes the call raw either - {@code Bot.canPlayerFitWithinBlocksAndEntitiesWhen}
+     * inflates by this same negative epsilon first.
+     */
+    private static final double EPSILON = 1.0E-7;
+
+    /** Depth of the slab probed under the feet, as {@code Bot.updateSupportingBlockPos} uses. */
+    private static final double SUPPORT_PROBE = 1.0E-6;
+
+    /**
+     * Whether the bot could stand with its feet exactly in this cell.
+     *
+     * <p>Order matters: {@link #occupiable} must be tested first. The support probe's {@code maxY}
+     * equals the body's {@code minY} and {@code intersects} is inclusive, so an upward-facing
+     * cluster sitting in the destination cell itself would otherwise register as "supported" -
+     * {@code occupiable} is the thing that rejects it.
+     *
+     * <p>The chunk guard is load-bearing rather than defensive: {@code World.getBlockStateId}
+     * returns 0 (air) for an unloaded section, so in unloaded chunks the collision tests answer a
+     * confident "clear" for solid rock.
+     */
     public static boolean standable(final int x, final int y, final int z) {
-        final Block floor = World.getBlock(x, y - 1, z);
-        if (!World.blocksMotion(floor)) return false;
-        return !World.blocksMotion(World.getBlock(x, y, z))
-            && !World.blocksMotion(World.getBlock(x, y + 1, z));
+        if (!World.isChunkLoadedBlockPos(x, z)) return false;
+        final double cx = x + 0.5, cz = z + 0.5;
+        return occupiable(cx, y, cz) && supported(cx, y, cz);
+    }
+
+    /**
+     * Nothing solid overlaps the player's body here.
+     *
+     * <p>Shape-exact, and it replaces {@code blocksMotion} on the body cells in <b>both</b>
+     * directions. {@code World.blocksMotion} is {@code Block.solidBlock()} bar cobweb and bamboo,
+     * and {@code solidBlock()} is <b>true</b> for {@code amethyst_cluster} and all three buds - so
+     * the old test rejected every cell containing any crystal, including ones the 0.6-wide player
+     * fits in perfectly well (a small bud occupies 0.8125..1.0 on its axis; the centred player box
+     * is 0.2..0.8, which does not overlap at all).
+     */
+    public static boolean occupiable(final double x, final double y, final double z) {
+        return World.isSpaceEmpty(playerBoxAt(x, y, z).inflate(-EPSILON, -EPSILON, -EPSILON));
+    }
+
+    /** Cell-centre convenience. */
+    public static boolean fits(final int x, final int y, final int z) {
+        return occupiable(x + 0.5, y, z + 0.5);
+    }
+
+    /**
+     * Something presents a real collision surface exactly at the feet plane.
+     *
+     * <p>This is the fix for the actual wedging bug. The old test only asked whether the block
+     * underfoot "stops motion", which is true of a crystal as much as of stone - but a floor-facing
+     * cluster tops out {@code 0.5625} below the cell and a bud lower still. The bot's step height is
+     * {@code 0.6}, above every one of those, so it would step onto the crystal and settle BELOW the
+     * cell the solver had chosen. From that moment {@code floorI(y)} names the crystal's own cell as
+     * the bot's feet cell, and every cell-indexed test in the plugin and in Baritone agrees the bot
+     * is standing inside a cluster - which is unroutable. That is the wedge.
+     */
+    public static boolean supported(final double x, final double y, final double z) {
+        final LocalizedCollisionBox body = playerBoxAt(x, y, z);
+        return World.findSupportingBlockPos(new LocalizedCollisionBox(
+            body.minX(), body.maxX(),
+            body.minY() - SUPPORT_PROBE, body.minY(),
+            body.minZ(), body.maxZ(),
+            x, y, z)).isPresent();
+    }
+
+    /**
+     * The player's own standing collision box, anchored anywhere.
+     *
+     * <p>Always {@code STANDING}, never {@code BOT.getPose()}: the engine silently auto-crouches to
+     * a 1.5 tall box when standing does not fit, so a pose-dependent test would call a cell clear
+     * that the bot cannot actually stand up in.
+     */
+    public static LocalizedCollisionBox playerBoxAt(final double x, final double y, final double z) {
+        return new LocalizedCollisionBox(BOT.getCollisionBox(Pose.STANDING), x, y, z);
     }
 }

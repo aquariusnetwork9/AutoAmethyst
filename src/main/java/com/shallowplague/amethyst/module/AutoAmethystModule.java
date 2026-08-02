@@ -7,6 +7,7 @@ import com.zenith.event.client.ClientBotTick;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.MoveToHotbarSlot;
 import com.zenith.feature.inventory.actions.SetHeldItem;
+import com.zenith.feature.inventory.actions.ClickItem;
 import com.zenith.feature.player.Position;
 import com.zenith.feature.player.RotationHelper;
 import com.zenith.feature.player.World;
@@ -25,6 +26,7 @@ import it.unimi.dsi.fastutil.longs.LongIterator;
 import org.cloudburstmc.math.vector.Vector2f;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.EquipmentSlot;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.MoveToHotbarAction;
+import org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes;
 import org.jspecify.annotations.Nullable;
@@ -73,6 +75,16 @@ public class AutoAmethystModule extends Module {
     /** Refuse to scan an absurd box; a geode interior is tens of blocks across, not hundreds. */
     private static final int MAX_BOX_VOLUME = 262_144; // 64^3
 
+    /**
+     * Container 0 slot layout: 0 crafting result, 1-4 crafting grid, 5-8 armour, 9-35 main
+     * inventory, 36-44 hotbar, 45 offhand. The farm stores into 9-35 only and never touches the
+     * hotbar, which is where the pickaxes live.
+     */
+    public static final int INVENTORY_FIRST = 9;
+    public static final int INVENTORY_LAST = 35;
+    public static final int HOTBAR_FIRST = 36;
+    public static final int HOTBAR_LAST = 44;
+
     private enum State { IDLE, TRAVEL, ENGAGE, SETTLE, COLLECTING, DEPOSITING, GOING_HOME }
 
     private final Timer scanTimer = Timers.tickTimer();
@@ -113,7 +125,13 @@ public class AutoAmethystModule extends Module {
     /** Horizontal cells either side searched for a position with a clean shot at a cluster. */
     private static final int STAND_SEARCH_RADIUS = 3;
 
+    /** Ticks to wait after a hotbar move so the inventory cache reflects it before the next. */
+    private static final int HOTBAR_TIDY_SETTLE_TICKS = 10;
+
     private long tickCounter = 0;
+    private int hotbarTidyCooldown = 0;
+    private volatile boolean depositRequested = false;
+    private long hotbarMoves = 0;
     /** Tick before which no new home leg may start, so parking cannot become a walk-stop loop. */
     private long homeRetryAfter = 0;
     /** Target the stand-cell solver has already been run for, so it runs once per engagement. */
@@ -359,8 +377,10 @@ public class AutoAmethystModule extends Module {
      */
     private void tickIdle() {
         if (!ensureTool()) return;
+        if (tidyHotbar()) return;
 
         if (shouldDeposit()) {
+            depositRequested = false;
             yieldBeforeDeposit = countYield();
             travel.stop();
             depositCycle.begin(
@@ -644,16 +664,105 @@ public class AutoAmethystModule extends Module {
     private boolean shouldDeposit() {
         final AutoAmethystConfig.Deposit cfg = PLUGIN_CONFIG.deposit;
         if (!cfg.enabled || !cfg.posSet) return false;
+        if (depositRequested) return true;
         return freeInventorySlots() <= Math.max(0, cfg.triggerFreeSlots);
     }
 
+    /**
+     * Runs one deposit cycle at the next opportunity, however empty the inventory is.
+     *
+     * <p>Purely so the run can be tested on demand. Filling 27 slots takes roughly 1700 shards,
+     * which at ~8.8 a cluster is around 190 clusters - many hours of growth - so waiting for a
+     * natural trigger is not a practical way to find out whether any of this works.
+     */
+    public void requestDeposit() {
+        depositRequested = true;
+    }
+
+    /**
+     * Free slots in the main inventory, slots 9-35.
+     *
+     * <p><b>The hotbar is deliberately excluded.</b> Slots 36-44 hold the pickaxes, so counting
+     * them made "the inventory is full" mean something different from what it should, and would
+     * have had the deposit run treat tools as spare space. The farm fills the 27 storage slots and
+     * leaves the hotbar alone.
+     */
     private int freeInventorySlots() {
         final List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
         int free = 0;
-        for (int slot = 9; slot <= 44; slot++) {
+        for (int slot = INVENTORY_FIRST; slot <= INVENTORY_LAST; slot++) {
             if (inv.get(slot) == Container.EMPTY_STACK) free++;
         }
         return free;
+    }
+
+    // ------------------------------------------------------------------ hotbar hygiene
+
+    /**
+     * Moves harvested amethyst out of the hotbar and into the main inventory.
+     *
+     * <p><b>This is not tidiness, it is required behaviour.</b> Vanilla puts a picked-up item in
+     * the first slot that will take it, scanning the <i>hotbar first</i>, so shards land there
+     * constantly and simply stay. Two hotbar slots are deliberately kept free to hold shulkers -
+     * one empty, one filled - so that a filled shulker can always be picked straight back up rather
+     * than left on the ground to despawn. Shards squatting in those slots defeat that entirely, and
+     * they also make the "inventory is full" test meaningless.
+     *
+     * <p>One move per call, then a short settle: an inventory action is a click pair and the cache
+     * needs a moment to reflect it, so issuing several at once just races itself.
+     *
+     * @return true when a move is in flight and the caller should do nothing else this tick
+     */
+    private boolean tidyHotbar() {
+        if (hotbarTidyCooldown > 0) {
+            hotbarTidyCooldown--;
+            return true;
+        }
+        // A click into container 0 while a window is open is meaningless, and the cache is stale.
+        if (CACHE.getPlayerCache().getInventoryCache().getOpenContainer().getContainerId() != 0) {
+            return false;
+        }
+        final List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
+        for (int slot = HOTBAR_FIRST; slot <= HOTBAR_LAST; slot++) {
+            final ItemStack stack = inv.get(slot);
+            if (stack == Container.EMPTY_STACK) continue;
+            if (!HarvestPolicy.isAnyAmethystYield(stack)) continue; // tools and shulkers stay put
+            final int dest = destinationFor(inv, stack);
+            if (dest < 0) return false; // nowhere to put it; the deposit trigger deals with that
+            INVENTORY.submit(InventoryActionRequest.builder()
+                .owner(this)
+                .priority(harvest().inputPriority)
+                .actions(new ClickItem(0, slot, ClickItemAction.LEFT_CLICK),
+                         new ClickItem(0, dest, ClickItemAction.LEFT_CLICK))
+                .build());
+            hotbarTidyCooldown = HOTBAR_TIDY_SETTLE_TICKS;
+            hotbarMoves++;
+            debug("Moved amethyst out of hotbar slot {} into inventory slot {}",
+                slot - HOTBAR_FIRST, dest);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Where a stack should go in the main inventory: onto a partial stack of the same item if there
+     * is one with room, otherwise the first empty slot. Merging first matters because the hotbar
+     * refills constantly, and one slot per trickle of shards would burn through the inventory.
+     */
+    private static int destinationFor(final List<ItemStack> inv, final ItemStack stack) {
+        int firstEmpty = -1;
+        for (int slot = INVENTORY_FIRST; slot <= INVENTORY_LAST; slot++) {
+            final ItemStack candidate = inv.get(slot);
+            if (candidate == Container.EMPTY_STACK) {
+                if (firstEmpty < 0) firstEmpty = slot;
+                continue;
+            }
+            if (candidate.getId() != stack.getId()) continue;
+            final ItemData data = ItemRegistry.REGISTRY.get(candidate.getId());
+            final int max = data == null ? 64 : Math.max(1, data.stackSize());
+            if (candidate.getAmount() + stack.getAmount() <= max) return slot;
+        }
+        return firstEmpty;
     }
 
     // ------------------------------------------------------------------ scanning

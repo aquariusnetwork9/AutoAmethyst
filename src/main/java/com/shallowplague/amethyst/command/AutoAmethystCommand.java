@@ -274,6 +274,24 @@ public class AutoAmethystCommand extends Command {
                     .title("Drop collection " + toggleStrCaps(PLUGIN_CONFIG.collection.enabled));
             })))
             .then(literal("deposit")
+                .then(literal("now").executes(c -> {
+                    module().requestDeposit();
+                    c.getSource().getEmbed()
+                        .title("Deposit run requested")
+                        .description("Runs one full cycle at the next opportunity regardless of how "
+                            + "full the inventory is. Filling 27 slots takes roughly 1700 shards, "
+                            + "so this is the only practical way to test the run.")
+                        .primaryColor();
+                }))
+                .then(literal("trigger").then(argument("freeslots", integer(0, 27)).executes(c -> {
+                    PLUGIN_CONFIG.deposit.triggerFreeSlots = getInteger(c, "freeslots");
+                    c.getSource().getEmbed()
+                        .title("Deposit trigger set")
+                        .description("Deposits when " + PLUGIN_CONFIG.deposit.triggerFreeSlots
+                            + " or fewer of the 27 inventory slots are free. The hotbar is not "
+                            + "counted - it holds the pickaxes and the two reserved shulker slots.")
+                        .primaryColor();
+                })))
                 .then(literal("here").executes(c -> {
                     if (!connected()) {
                         c.getSource().getEmbed().title("Not connected").errorColor();
