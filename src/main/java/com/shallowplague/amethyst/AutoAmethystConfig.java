@@ -374,6 +374,15 @@ public class AutoAmethystConfig {
         public int triggerFreeSlots = 4;
 
         /**
+         * Go and empty out once this many inventory slots hold harvested amethyst.
+         *
+         * <p>Small and frequent beats one big run at the end. The inventory then never approaches
+         * full, so there is always room to hold a broken shulker and a fresh empty one - which is
+         * exactly the room the cycle ran out of when it only triggered on a nearly-full inventory.
+         */
+        public int depositAtStacks = 9;
+
+        /**
          * When the shulker fills: break it (shulkers keep their contents), pick it up, and place a
          * fresh empty one. Turning this off makes a full shulker pause the module instead.
          */
@@ -390,6 +399,9 @@ public class AutoAmethystConfig {
         public int phaseTimeoutTicks = 1200;
 
         /** Placement attempts before giving up on putting a shulker at the deposit position. */
+        /** Ticks one placement attempt gets before it is counted as failed. */
+        public int placeTimeoutTicks = 80;
+
         public int maxPlaceAttempts = 5;
 
         /** Give up breaking the full shulker after this long. */

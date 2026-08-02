@@ -665,6 +665,10 @@ public class AutoAmethystModule extends Module {
         final AutoAmethystConfig.Deposit cfg = PLUGIN_CONFIG.deposit;
         if (!cfg.enabled || !cfg.posSet) return false;
         if (depositRequested) return true;
+        // Small and frequent. Going once nine slots hold shards keeps the inventory well clear of
+        // full, which is what guarantees there is always room to hold a broken shulker and a fresh
+        // empty one - the room the cycle ran out of when it only went on a nearly-full inventory.
+        if (yieldStacksCarried() >= Math.max(1, cfg.depositAtStacks)) return true;
         return freeInventorySlots() <= Math.max(0, cfg.triggerFreeSlots);
     }
 
@@ -687,6 +691,17 @@ public class AutoAmethystModule extends Module {
      * have had the deposit run treat tools as spare space. The farm fills the 27 storage slots and
      * leaves the hotbar alone.
      */
+    /** Inventory slots (9-35 only) holding harvested amethyst. The hotbar is not counted. */
+    private int yieldStacksCarried() {
+        final List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
+        int stacks = 0;
+        for (int slot = INVENTORY_FIRST; slot <= INVENTORY_LAST; slot++) {
+            final ItemStack stack = inv.get(slot);
+            if (stack != Container.EMPTY_STACK && isOurYield(stack)) stacks++;
+        }
+        return stacks;
+    }
+
     private int freeInventorySlots() {
         final List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
         int free = 0;

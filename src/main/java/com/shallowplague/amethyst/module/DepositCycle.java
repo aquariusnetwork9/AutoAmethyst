@@ -5,19 +5,24 @@ import com.zenith.cache.data.inventory.Container;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.ClickItem;
 import com.zenith.feature.inventory.actions.CloseContainer;
+import com.zenith.feature.inventory.actions.SetHeldItem;
+import com.zenith.feature.inventory.actions.MoveToHotbarSlot;
 import com.zenith.feature.pathfinder.Baritone;
 import com.zenith.feature.player.ClickTarget;
+import com.zenith.feature.pathfinder.movement.MovementHelper;
 import com.zenith.feature.player.Input;
 import com.zenith.feature.player.InputRequest;
 import com.zenith.feature.player.Position;
 import com.zenith.feature.player.RotationHelper;
 import com.zenith.feature.player.World;
 import com.zenith.mc.block.Block;
+import com.zenith.mc.block.BlockPos;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import org.cloudburstmc.math.vector.Vector2f;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction;
+import org.geysermc.mcprotocollib.protocol.data.game.inventory.MoveToHotbarAction;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes;
 import org.jspecify.annotations.Nullable;
@@ -102,6 +107,8 @@ public final class DepositCycle {
     private final AutoAmethystConfig.Collection collectCfg = new AutoAmethystConfig.Collection();
     /** Monotonic tick count, only used to age the collector's retry cooldowns. */
     private long ticks = 0;
+    /** Ticks spent on the current placement attempt, judged by the world rather than a timer. */
+    private int placeTicks = 0;
 
     private Phase phase = Phase.IDLE;
     private int phaseTicks = 0;
@@ -170,7 +177,7 @@ public final class DepositCycle {
         return switch (phase) {
             case APPROACH -> approach(cfg.x, cfg.y, cfg.z, cfg, reach, Phase.ENSURE_CONTAINER);
             case ENSURE_CONTAINER -> tickEnsureContainer(cfg);
-            case PLACE_SHULKER -> tickPlaceShulker(cfg);
+            case PLACE_SHULKER -> tickPlaceShulker(cfg, priority);
             case OPEN -> open(cfg.x, cfg.y, cfg.z, cfg, reach, requireLineOfSight, priority, Phase.TRANSFER);
             case TRANSFER -> transfer(yield, cfg, Phase.CLOSE_DONE, true);
             case CLOSE_FULL -> close(Phase.BREAK_SHULKER);
@@ -365,7 +372,16 @@ public final class DepositCycle {
         return fail("deposit position holds " + at.name() + ", which this plugin will not break");
     }
 
-    private Status tickPlaceShulker(final AutoAmethystConfig.Deposit cfg) {
+    private Status tickPlaceShulker(final AutoAmethystConfig.Deposit cfg, final int priority) {
+        // Judged by the world. PLACE_SHULKER now holds until the block actually appears instead of
+        // firing once and bouncing to ENSURE_CONTAINER to look, which is what made every attempt
+        // cancel the previous one.
+        if (HarvestPolicy.isShulkerBlock(World.getBlock(cfg.x, cfg.y, cfg.z))) {
+            placeTicks = 0;
+            placeAttempts = 0;
+            advance(Phase.OPEN); // already there - nothing to place
+            return Status.BUSY;
+        }
         // Get out of our own way first. Zenith refuses to place into a block occupied by anything
         // that blocks building, and the bot counts - it logs "an entity is blocking the place
         // position" and stops, forever, because standing still changes nothing. This is easy to
@@ -406,13 +422,83 @@ public final class DepositCycle {
                 : "no empty shulker box to place, and no supply chest is set "
                   + "(stand by one and run 'deposit supply here')");
         }
-        final ItemStack stack = CACHE.getPlayerCache().getPlayerInventory().get(slot);
-        final ItemData data = ItemRegistry.REGISTRY.get(stack.getId());
-        if (data == null) return fail("could not resolve the shulker item");
-        BARITONE.placeBlock(cfg.x, cfg.y, cfg.z, data);
-        actionCooldown = Math.max(1, cfg.stepSettleTicks);
-        advance(Phase.ENSURE_CONTAINER);
+        // Get the shulker into the hand, then keep right-clicking the support block until the
+        // shulker actually appears. Emphatically NOT BARITONE.placeBlock: that is why this cycle
+        // had never once completed. It needs about ten ticks just to move the item into the hand
+        // (the inventory manager paces one action per five), and InteractWithProcess.interact
+        // begins by calling onLostControl - so re-issuing it destroys the attempt already in
+        // flight. The old code re-issued every ~8 ticks from ENSURE_CONTAINER, burned all five
+        // attempts in two seconds and paused the farm. It could never have converged.
+        //
+        // Choosing the item by slot also fixes a trap for free: Baritone picks the item to place by
+        // matching the item id, and an empty and a full shulker box share one id, so it would
+        // happily put the FULL one back down and loop forever.
+        if (slot >= 36 && slot <= 44) {
+            if (CACHE.getPlayerCache().getHeldItemSlot() != slot - 36) {
+                INVENTORY.submit(InventoryActionRequest.builder()
+                    .owner(owner).priority(priority)
+                    .actions(new SetHeldItem(slot - 36))
+                    .build());
+                return Status.BUSY;
+            }
+        } else {
+            // Park it in the last hotbar index, well clear of the pickaxe the module keeps at 0.
+            INVENTORY.submit(InventoryActionRequest.builder()
+                .owner(owner).priority(priority)
+                .actions(new MoveToHotbarSlot(slot, MoveToHotbarAction.from(8)), new SetHeldItem(8))
+                .build());
+            return Status.BUSY;
+        }
+
+        final BlockPos support = findSupportFace(cfg.x, cfg.y, cfg.z);
+        if (support == null) {
+            return fail("nothing solid to place the shulker against at the deposit position - "
+                + "amethyst, buds and other shulkers cannot be placed against");
+        }
+        // Aim at the centre of the shared face, which is what decides where the block lands.
+        final Vector2f rot = RotationHelper.rotationTo(
+            support.x() + 0.5 + (cfg.x - support.x()) * 0.5,
+            support.y() + 0.5 + (cfg.y - support.y()) * 0.5,
+            support.z() + 0.5 + (cfg.z - support.z()) * 0.5);
+        INPUTS.submit(InputRequest.builder()
+            .owner(owner)
+            .input(Input.builder()
+                .hand(Hand.MAIN_HAND)
+                .clickRequiresRotation(true)
+                .clickTarget(new ClickTarget.BlockPosition(support.x(), support.y(), support.z()))
+                .rightClick(true)
+                .build())
+            .yaw(rot.getX())
+            .pitch(rot.getY())
+            .priority(priority)
+            .build());
+        // Stay in this phase and judge by the world, not by a timer. One attempt gets a real budget
+        // rather than being abandoned after six ticks.
+        if (++placeTicks > Math.max(60, cfg.placeTimeoutTicks)) {
+            placeTicks = 0;
+            placeAttempts++;
+        }
         return Status.BUSY;
+    }
+
+    /**
+     * A neighbour of the deposit position that a block can actually be placed against.
+     *
+     * <p>Needed because {@code MovementHelper.canPlaceAgainst} requires a normal cube, and
+     * {@code isBlockNormalCube} excludes shulker boxes and every amethyst-named block bar plain
+     * amethyst_block. A deposit spot surrounded by crystal therefore has no valid support face at
+     * all, and the placement is a silent no-op rather than an error.
+     */
+    private static @Nullable BlockPos findSupportFace(final int x, final int y, final int z) {
+        final int[][] faces = {{0, -1, 0}, {0, 1, 0}, {-1, 0, 0}, {1, 0, 0}, {0, 0, -1}, {0, 0, 1}};
+        for (final int[] f : faces) {
+            final int nx = x + f[0], ny = y + f[1], nz = z + f[2];
+            if (!World.isChunkLoadedBlockPos(nx, nz)) continue;
+            if (MovementHelper.canPlaceAgainst(World.getBlockStateId(nx, ny, nz))) {
+                return new BlockPos(nx, ny, nz);
+            }
+        }
+        return null;
     }
 
     private Status tickBreakShulker(final AutoAmethystConfig.Deposit cfg, final double reach,
