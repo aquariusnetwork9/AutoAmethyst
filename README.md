@@ -6,8 +6,8 @@ clusters from a fixed geode rig.
 Built against **stock ZenithProxy 1.21.4**. No fork, no core changes, no Baritone patches — it
 loads into an unmodified `java`-channel instance from `plugins/`.
 
-> **Status: 0.1.0, compile-verified only.** It has never been run against a live server. Treat the
-> first run as a test.
+> **Status: 1.0.0.** Field-tested on a live AFK farm over an extended session with no anticheat
+> action against the account.
 
 ---
 
@@ -249,6 +249,38 @@ chunks near a player, so parts of the geode may simply not be ticking from where
 
 Amethyst clusters drop no experience, so Mending never repairs anything here. Use Unbreaking III and
 let the plugin swap pickaxes at a durability threshold instead (`swapat`, default 10%).
+
+## Talking to AutoAmethyst from other code
+
+ZenithProxy loads every plugin jar in its own `URLClassLoader`, sharing only the core application
+classes with its siblings — one plugin cannot reference another plugin's classes directly, however
+it is compiled. That constraint shapes both integration paths below; neither is a workaround for
+it, they're what it actually allows.
+
+**Embedded directly into a bundle plugin** (this package compiled or vendored alongside yours, so
+you share a classloader): call `AutoAmethystPlugin.api()` for a live
+[`AutoAmethystApi`](src/main/java/com/shallowplague/amethyst/api/AutoAmethystApi.java) reference —
+status, stats, pause/resume, deposit/reload requests — and subscribe to its lifecycle events
+(`HarvestBreakEvent`, `PausedEvent`, `ResumedEvent`, `DepositCompletedEvent`) on `Globals.EVENT_BUS`
+like any other Zenith module.
+
+**A separate plugin jar loaded alongside AutoAmethyst**, with no shared classes: go through the
+core plugin registry plus reflection. Every `AutoAmethystApi` method is deliberately typed in
+`String`/`boolean`/`long`/`List<String>`/`Map<String, Object>` — JDK classes are the one thing
+guaranteed identical across the classloader boundary — so this works with zero compile-time
+dependency on this plugin's jar:
+
+```java
+var autoAmethyst = pluginManager.getPlugin("auto-amethyst"); // ZenithProxyPlugin, a core type
+if (autoAmethyst != null) {
+    Map<?, ?> stats = (Map<?, ?>) autoAmethyst.getClass().getMethod("stats").invoke(autoAmethyst);
+    boolean paused = (boolean) autoAmethyst.getClass().getMethod("isPaused").invoke(autoAmethyst);
+}
+```
+
+Custom events do not cross this boundary at all — ZenithProxy's event bus dispatches by exact
+`Class` identity, and a separate jar can never obtain the same `Class` object for AutoAmethyst's
+event types. A separate-jar consumer should poll `stats()`/`diagnose()` instead of subscribing.
 
 ## Building
 

@@ -1,0 +1,10 @@
+package com.shallowplague.amethyst.event;
+
+/**
+ * Posted to {@code Globals.EVENT_BUS} when a deposit cycle finishes.
+ *
+ * <p>See {@link HarvestBreakEvent} for this event's classloader scope: only code sharing
+ * AutoAmethyst's classloader can subscribe to it.
+ */
+public record DepositCompletedEvent(int shulkersStored, int itemsDeposited) {
+}

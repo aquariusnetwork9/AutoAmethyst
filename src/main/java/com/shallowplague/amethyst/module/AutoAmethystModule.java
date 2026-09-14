@@ -2,6 +2,11 @@ package com.shallowplague.amethyst.module;
 
 import com.github.rfresh2.EventConsumer;
 import com.shallowplague.amethyst.AutoAmethystConfig;
+import com.shallowplague.amethyst.api.AutoAmethystApi;
+import com.shallowplague.amethyst.event.DepositCompletedEvent;
+import com.shallowplague.amethyst.event.HarvestBreakEvent;
+import com.shallowplague.amethyst.event.PausedEvent;
+import com.shallowplague.amethyst.event.ResumedEvent;
 import com.zenith.cache.data.inventory.Container;
 import com.zenith.event.client.ClientBotTick;
 import com.zenith.feature.inventory.InventoryActionRequest;
@@ -47,6 +52,7 @@ import static com.github.rfresh2.EventConsumer.of;
 import static com.shallowplague.amethyst.AutoAmethystPlugin.PLUGIN_CONFIG;
 import static com.zenith.Globals.BOT;
 import static com.zenith.Globals.CACHE;
+import static com.zenith.Globals.EVENT_BUS;
 import static com.zenith.Globals.EXECUTOR;
 import static com.zenith.Globals.INVENTORY;
 
@@ -70,7 +76,7 @@ import static com.zenith.Globals.INVENTORY;
  * See {@link BreakDriver}. Short version: the vanilla interaction manager does destroy progress,
  * sequence numbers and swing packets correctly, and hand-rolled break packets get vetoed.
  */
-public class AutoAmethystModule extends Module {
+public class AutoAmethystModule extends Module implements AutoAmethystApi {
 
     /** Refuse to scan an absurd box; a geode interior is tens of blocks across, not hundreds. */
     private static final int MAX_BOX_VOLUME = 262_144; // 64^3
@@ -231,6 +237,7 @@ public class AutoAmethystModule extends Module {
     }
 
     /** Called from the command thread when config changed in a way that invalidates runtime state. */
+    @Override
     public void requestReload() {
         reloadRequested = true;
     }
@@ -598,7 +605,8 @@ public class AutoAmethystModule extends Module {
             case DONE -> {
                 deposits++;
                 final int after = countYield();
-                if (yieldBeforeDeposit > after) depositedTotal += yieldBeforeDeposit - after;
+                final int justDeposited = Math.max(0, yieldBeforeDeposit - after);
+                depositedTotal += justDeposited;
                 yieldNow = after;
                 yieldAtStart = after;
                 shulkersStored = depositCycle.shulkersStored();
@@ -606,6 +614,7 @@ public class AutoAmethystModule extends Module {
                 collector.clearCooldowns();
                 scanTimer.skip();
                 state = State.IDLE;
+                EVENT_BUS.post(new DepositCompletedEvent(shulkersStored, justDeposited));
                 if (freeInventorySlots() <= Math.max(0, PLUGIN_CONFIG.deposit.triggerFreeSlots)) {
                     pause(PLUGIN_CONFIG.deposit.chestSet
                         ? "deposit finished but the inventory is still full - check the storage chest"
@@ -679,6 +688,7 @@ public class AutoAmethystModule extends Module {
      * which at ~8.8 a cluster is around 190 clusters - many hours of growth - so waiting for a
      * natural trigger is not a practical way to find out whether any of this works.
      */
+    @Override
     public void requestDeposit() {
         depositRequested = true;
     }
@@ -915,6 +925,7 @@ public class AutoAmethystModule extends Module {
         settleTicks = Math.max(1, harvest().interBreakDelayTicks);
         state = State.SETTLE;
         logHarvest(pos);
+        EVENT_BUS.post(new HarvestBreakEvent(breaks, yieldGained()));
     }
 
     /** Target is no longer valid but is not the target's fault; re-scan and pick another. */
@@ -1203,6 +1214,7 @@ public class AutoAmethystModule extends Module {
      * <p>Reports box-relative offsets rather than world coordinates, so the output is safe to paste
      * anywhere.
      */
+    @Override
     public List<String> diagnose() {
         final List<String> out = new java.util.ArrayList<>();
         out.add("state=" + stateName() + "  mode=" + mode());
@@ -1360,9 +1372,11 @@ public class AutoAmethystModule extends Module {
         depositCycle.reset();
         warn("Paused: {}", reason);
         inGameAlertActivePlayer("<red>Paused:<reset> " + reason);
+        EVENT_BUS.post(new PausedEvent(reason));
     }
 
     /** Clears a pause so the module retries. Called from the command. */
+    @Override
     public void resume() {
         paused = false;
         pauseReason = "";
@@ -1370,10 +1384,14 @@ public class AutoAmethystModule extends Module {
         state = State.IDLE;
         anchorSet = false;
         scanTimer.skip();
+        EVENT_BUS.post(new ResumedEvent());
     }
 
+    @Override
     public boolean isPaused() { return paused; }
+    @Override
     public String pauseReason() { return pauseReason; }
+    @Override
     public String stateName() {
         if (paused) return "PAUSED";
         if (state == State.DEPOSITING) return "DEPOSIT:" + depositCycle.phaseName();
@@ -1391,4 +1409,40 @@ public class AutoAmethystModule extends Module {
     public int shardsStranded() { return collector.strandedStacks(); }
     public int reachableCount() { return matureTargets.size(); }
     public boolean pathfinderClamped() { return pathGuard.isApplied() && pathGuard.stillClamped(); }
+
+    // ------------------------------------------------------------------ AutoAmethystApi
+
+    /**
+     * Enables or disables the module and persists the choice, mirroring what the
+     * {@code autoamethyst on/off} command does. Overrides {@link Module#setEnabled}, which only
+     * toggles runtime state and does not touch config.
+     */
+    @Override
+    public void setEnabled(final boolean enabled) {
+        PLUGIN_CONFIG.harvest.enabled = enabled;
+        syncEnabledFromConfig();
+    }
+
+    @Override
+    public Map<String, Object> stats() {
+        final Map<String, Object> out = new HashMap<>();
+        out.put("state", stateName());
+        out.put("paused", paused);
+        out.put("pauseReason", pauseReason);
+        out.put("breaks", breaks);
+        out.put("skipped", skipped);
+        out.put("reverts", reverts);
+        out.put("toolSwaps", toolSwaps);
+        out.put("deposits", deposits);
+        out.put("shulkersStored", shulkersStored);
+        out.put("matureInBox", matureInBox);
+        out.put("reachableCount", reachableCount());
+        out.put("shardsOnGround", shardsOnGround());
+        out.put("shardStacksOnGround", shardStacksOnGround());
+        out.put("shardsStranded", shardsStranded());
+        out.put("yieldGained", yieldGained());
+        out.put("yieldPerHour", yieldPerHour());
+        out.put("pathfinderClamped", pathfinderClamped());
+        return out;
+    }
 }

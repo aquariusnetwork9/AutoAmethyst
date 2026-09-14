@@ -1,5 +1,6 @@
 package com.shallowplague.amethyst;
 
+import com.shallowplague.amethyst.api.AutoAmethystApi;
 import com.shallowplague.amethyst.command.AutoAmethystCommand;
 import com.shallowplague.amethyst.module.AutoAmethystModule;
 import com.shallowplague.amethyst.module.PathfinderGuard;
@@ -7,6 +8,7 @@ import com.zenith.plugin.api.Plugin;
 import com.zenith.plugin.api.PluginAPI;
 import com.zenith.plugin.api.ZenithProxyPlugin;
 import net.kyori.adventure.text.logger.slf4j.ComponentLogger;
+import org.jspecify.annotations.Nullable;
 
 @Plugin(
     id = BuildConstants.PLUGIN_ID,
@@ -19,15 +21,31 @@ import net.kyori.adventure.text.logger.slf4j.ComponentLogger;
 public class AutoAmethystPlugin implements ZenithProxyPlugin {
     public static AutoAmethystConfig PLUGIN_CONFIG;
     public static ComponentLogger LOG;
+    private static @Nullable AutoAmethystApi API;
 
     @Override
     public void onLoad(PluginAPI pluginAPI) {
         LOG = pluginAPI.getLogger();
         PLUGIN_CONFIG = pluginAPI.registerConfig(BuildConstants.PLUGIN_ID, AutoAmethystConfig.class);
         recoverPathfinderSettings();
-        pluginAPI.registerModule(new AutoAmethystModule());
+        final AutoAmethystModule module = new AutoAmethystModule();
+        API = module;
+        pluginAPI.registerModule(module);
         pluginAPI.registerCommand(new AutoAmethystCommand());
         LOG.info("AutoAmethyst {} loaded", BuildConstants.VERSION);
+    }
+
+    /**
+     * The live status/control surface described in {@link AutoAmethystApi}, for code that shares
+     * this plugin's classloader - typically this package embedded directly into a larger bundle
+     * plugin. Null until {@link #onLoad} has run.
+     *
+     * <p>A separate plugin jar cannot see the {@link AutoAmethystApi} type at all (see its
+     * Javadoc for why) and should instead go through
+     * {@code PluginManager.getPlugin("auto-amethyst")} plus reflection.
+     */
+    public static @Nullable AutoAmethystApi api() {
+        return API;
     }
 
     /**
